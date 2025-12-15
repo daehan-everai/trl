@@ -63,6 +63,7 @@ from ...trainer.utils import (
 )
 from ..utils import DataCollatorForChatML
 from .gold_config import GOLDConfig
+from .teacher_client import VLLMTeacherClient, VLLMTeacherClientConfig
 
 
 if is_peft_available():
@@ -735,6 +736,7 @@ class GOLDTrainer(SFTTrainer):
     ):
         self.model_name_or_path = model if isinstance(model, str) else model.config._name_or_path
         self.model_revision = getattr(args, "student_model_revision", None)
+        self.use_external_teacher_vllm = getattr(args, "use_external_teacher_vllm", False)
         if isinstance(model, str) and self.model_revision is not None:
             args.model_init_kwargs = args.model_init_kwargs or {}
             args.model_init_kwargs.setdefault("revision", self.model_revision)
@@ -754,19 +756,21 @@ class GOLDTrainer(SFTTrainer):
             )
             self.use_liger_gkd_loss = True
 
-        if args.teacher_model_init_kwargs is None:
-            teacher_model_init_kwargs = {}
-        elif not isinstance(teacher_model, str):
-            raise ValueError(
-                "You passed teacher_model_init_kwargs to the GOLDConfig, but your teacher_model is already instantiated."
-            )
-        else:
-            teacher_model_init_kwargs = args.teacher_model_init_kwargs
-            teacher_model_init_kwargs["torch_dtype"] = (
-                teacher_model_init_kwargs["torch_dtype"]
-                if teacher_model_init_kwargs["torch_dtype"] in ["auto", None]
-                else getattr(torch, teacher_model_init_kwargs["torch_dtype"])
-            )
+        teacher_model_init_kwargs = {}
+        if not self.use_external_teacher_vllm:
+            if args.teacher_model_init_kwargs is None:
+                teacher_model_init_kwargs = {}
+            elif not isinstance(teacher_model, str):
+                raise ValueError(
+                    "You passed teacher_model_init_kwargs to the GOLDConfig, but your teacher_model is already instantiated."
+                )
+            else:
+                teacher_model_init_kwargs = args.teacher_model_init_kwargs
+                teacher_model_init_kwargs["torch_dtype"] = (
+                    teacher_model_init_kwargs["torch_dtype"]
+                    if teacher_model_init_kwargs["torch_dtype"] in ["auto", None]
+                    else getattr(torch, teacher_model_init_kwargs["torch_dtype"])
+                )
 
         if args.use_uld_loss and args.teacher_tokenizer_name_or_path is None:
             if isinstance(teacher_model, str):
@@ -776,7 +780,7 @@ class GOLDTrainer(SFTTrainer):
                     "`teacher_tokenizer_name_or_path` must be set when using ULD loss with a pre-instantiated teacher model."
                 )
 
-        if isinstance(teacher_model, str):
+        if not self.use_external_teacher_vllm and isinstance(teacher_model, str):
             init_kwargs = dict(teacher_model_init_kwargs)
             if "torch_dtype" in init_kwargs and "dtype" not in init_kwargs:
                 init_kwargs["dtype"] = init_kwargs.pop("torch_dtype")
@@ -787,6 +791,16 @@ class GOLDTrainer(SFTTrainer):
             self.teacher_tokenizer = AutoTokenizer.from_pretrained(args.teacher_tokenizer_name_or_path)
             if not hasattr(self.teacher_tokenizer, "pad_token") or self.teacher_tokenizer.pad_token is None:
                 self.teacher_tokenizer.pad_token = self.teacher_tokenizer.eos_token
+        self.teacher_client = None
+        if self.use_external_teacher_vllm:
+            self.teacher_client = VLLMTeacherClient(
+                VLLMTeacherClientConfig(
+                    base_url=args.teacher_vllm_base_url,
+                    model_name=args.teacher_vllm_model_name,
+                    timeout=args.teacher_vllm_timeout,
+                    max_retries=args.teacher_vllm_max_retries,
+                )
+            )
 
         # Hybrid ULD loss configuration is handled in ULDLoss class
 
@@ -806,13 +820,16 @@ class GOLDTrainer(SFTTrainer):
 
         if args.disable_dropout:
             disable_dropout_in_model(self.model)
-        if not args.use_uld_loss:
-            teacher_model.resize_token_embeddings(self.model.config.vocab_size)
+        if not self.use_external_teacher_vllm:
+            if not args.use_uld_loss:
+                teacher_model.resize_token_embeddings(self.model.config.vocab_size)
 
-        if self.is_deepspeed_enabled:
-            self.teacher_model = prepare_deepspeed(teacher_model, self.accelerator)
+            if self.is_deepspeed_enabled:
+                self.teacher_model = prepare_deepspeed(teacher_model, self.accelerator)
+            else:
+                self.teacher_model = self.accelerator.prepare_model(teacher_model, evaluation_mode=True)
         else:
-            self.teacher_model = self.accelerator.prepare_model(teacher_model, evaluation_mode=True)
+            self.teacher_model = None
 
         self.lmbda = args.lmbda
         self.beta = args.beta
