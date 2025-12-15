@@ -567,8 +567,8 @@ class ULDLoss(nn.Module):
     def _compute_hybrid_uld_loss(self, student_aligned, teacher_aligned):
         """
         Compute hybrid ULD loss on aligned probability distributions. This method:
-        1. Directly compares probabilities for tokens with matching vocabulary entries
-        2. Uses sorting approach only for tokens with different vocabulary entries
+        1. Reverse KL for tokens with matching vocabulary entries
+        2. Rank-sorted L1 for tokens with different vocabulary entries
 
         Args:
             student_aligned: Aligned student probabilities [seq_len, student_vocab_size]
@@ -599,7 +599,7 @@ class ULDLoss(nn.Module):
             teacher_matched_mask[teacher_matched_indices] = True
             student_matched_mask[student_matched_indices] = True
 
-        # 1. JSD loss for matched vocabulary tokens (direct semantic correspondence)
+        # 1. Reverse KL on matched vocabulary tokens (direct semantic correspondence)
         matched_loss = torch.tensor(0.0, device=device)
         matched_token_count = 0
         if len(teacher_matched_indices) > 0:
@@ -608,11 +608,10 @@ class ULDLoss(nn.Module):
             student_matched_probs = student_aligned[:, student_matched_indices]  # [seq_len, num_matched]
             matched_token_count = teacher_matched_probs.size(-1)
 
-            # Use JSD loss for semantically aligned tokens
-            # Convert probabilities back to logits for JSD computation
-
-            # Apply generalized JSD loss to matched tokens
-            matched_loss = self._compute_jsd_loss_for_matched_tokens(student_matched_probs, teacher_matched_probs)
+            eps = 1e-8
+            p = student_matched_probs.clamp_min(eps)
+            q = teacher_matched_probs.clamp_min(eps)
+            matched_loss = (p * (p.log() - q.log())).sum() / max(1, student_aligned.size(0))
 
         # 2. Sorted comparison loss for unmatched vocabulary tokens
         teacher_unmatched_mask = ~teacher_matched_mask
@@ -662,35 +661,6 @@ class ULDLoss(nn.Module):
         self.last_unmatched_loss = unmatched_loss
 
         return total_loss
-
-    def _compute_jsd_loss_for_matched_tokens(self, student_logits, teacher_logits):
-        """
-        Compute JSD loss for matched vocabulary tokens.
-
-        Args:
-            student_logits: Student logits for matched tokens [seq_len, num_matched]
-            teacher_logits: Teacher logits for matched tokens [seq_len, num_matched]
-        Returns:
-            JSD loss for matched tokens
-        """
-        # Reshape to [batch_size * seq_len, vocab_size] format expected by generalized_jsd_loss
-        batch_seq_len, num_matched = student_logits.shape
-
-        student_logits_reshaped = student_logits.view(-1, num_matched)
-        teacher_logits_reshaped = teacher_logits.view(-1, num_matched)
-
-        # Use the GOLD generalized JSD loss implementation that accepts probability inputs
-        jsd_loss = GOLDTrainer.generalized_jsd_loss(
-            student_logits_reshaped,
-            teacher_logits_reshaped,
-            labels=None,  # No masking needed for matched tokens
-            beta=self.beta,  # Standard JSD beta
-            temperature=1.0,  # Already applied in main computation
-            reduction="batchmean",
-            logits_are_probs=True,
-        )
-
-        return jsd_loss
 
     def _get_start_and_size_answers(self, answer_tensors):
         answers_index = []
