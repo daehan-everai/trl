@@ -52,3 +52,9 @@ All values are log-softmax log-probabilities.
 7. [x] Implement the external teacher path in `GOLDTrainer.compute_loss`: build teacher token IDs from `original_prompt_text`/`original_completion_text`, compute completion positions with correct shift, fetch teacher logprobs for only those positions, and compute the Hybrid ULD loss without materializing a full `[seq_len, vocab]` teacher tensor. (commit: e7e818d0)
 
 8. [x] Add focused tests: unit tests for reverse KL matched term + unmatched sorted L1 behavior on tiny tensors, and a lightweight integration test that hits the dummy teacher server and runs the external-teacher `compute_loss` path end-to-end (finite scalar loss, backprop-safe, no local teacher model load). (commit: fd95d08f)
+
+## Example Training (Dummy Teacher + MagistSmall)
+
+9. [x] Allow running from source checkout by tolerating missing `trl` package metadata when generating a model card. (commit: 8f3f41a8)
+
+10. [x] Add a runnable example that starts the dummy teacher server, loads `EverAI-AI/MagistSmall-Raven-DPO6-c`, and runs a short GOLD on-policy external-teacher training with WandB. (commit: 023f4e47)
