@@ -363,9 +363,17 @@ class ULDLoss(nn.Module):
                 distillation_losses.append(loss_i)
                 continue
 
+            # Next-token prediction alignment:
+            # - labels/input_ids identify the answer tokens at positions [start : start+size]
+            # - distributions that predict those tokens live at logits positions [start-1 : start-1+size]
+            if student_start <= 0 or teacher_start <= 0:
+                loss_i = student_logits[i].sum() * 0.0
+                distillation_losses.append(loss_i)
+                continue
+
             # Extract answer logits
-            student_answer_logits = student_logits[i, student_start : student_start + student_size]
-            teacher_answer_logits = teacher_logits[i, teacher_start : teacher_start + teacher_size]
+            student_answer_logits = student_logits[i, student_start - 1 : student_start - 1 + student_size]
+            teacher_answer_logits = teacher_logits[i, teacher_start - 1 : teacher_start - 1 + teacher_size]
 
             # Convert to probabilities
             student_probs = F.softmax(student_answer_logits / self.student_temperature, dim=-1)
