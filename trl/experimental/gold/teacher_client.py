@@ -40,7 +40,7 @@ def decode_base64_dense_fp16(data: str, shape: tuple[int, int]) -> torch.Tensor:
     rows, cols = shape
     expected_nbytes = int(rows) * int(cols) * 2
 
-    raw = base64.b64decode(data)
+    raw = bytearray(base64.b64decode(data))
     if len(raw) != expected_nbytes:
         raise ValueError(f"Decoded byte length {len(raw)} does not match expected {expected_nbytes} for shape={shape}.")
 
