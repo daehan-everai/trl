@@ -1334,6 +1334,166 @@ class GOLDTrainer(SFTTrainer):
             return jsd
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        if self.use_external_teacher_vllm:
+            if self.teacher_tokenizer is None or self.teacher_client is None or self.uld_loss_fn is None:
+                raise ValueError(
+                    "`use_external_teacher_vllm=True` requires `teacher_tokenizer`, `teacher_client`, and `uld_loss_fn` "
+                    "to be initialized."
+                )
+
+            if "original_prompt_text" in inputs and "original_completion_text" in inputs:
+                prompt_texts = inputs["original_prompt_text"]
+                completion_texts = inputs["original_completion_text"]
+            else:
+                # Fallback: decode student input_ids.
+                full_sequences = inputs["input_ids"]
+                full_texts = self.processing_class.batch_decode(full_sequences, skip_special_tokens=False)
+                prompt_texts = self.processing_class.batch_decode(inputs["prompts"], skip_special_tokens=False)
+                completion_texts = [full.replace(prompt, "", 1) for full, prompt in zip(full_texts, prompt_texts, strict=True)]
+
+            teacher_input_ids, teacher_labels, teacher_attention_mask, _ = build_teacher_inputs_from_texts(
+                self.teacher_tokenizer,
+                prompt_texts,
+                completion_texts,
+            )
+
+            outputs_student = model(
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs["attention_mask"],
+                use_cache=False,
+            )
+
+            # Create properly masked student labels
+            student_labels = inputs["labels"].clone()
+            if hasattr(self.processing_class, "pad_token_id") and self.processing_class.pad_token_id is not None:
+                student_labels[student_labels == self.processing_class.pad_token_id] = -100
+
+            # Also mask pad tokens in teacher labels for consistency
+            if self.teacher_tokenizer.pad_token_id is not None:
+                teacher_labels = teacher_labels.clone()
+                teacher_labels[teacher_labels == self.teacher_tokenizer.pad_token_id] = -100
+
+            student_answer_index, student_answer_size = self.uld_loss_fn._get_start_and_size_answers(student_labels)
+            teacher_answer_index, teacher_answer_size = self.uld_loss_fn._get_start_and_size_answers(teacher_labels)
+
+            if self.uld_loss_fn.skip_student_eos:
+                student_answer_size = [size - 1 for size in student_answer_size]
+            if self.uld_loss_fn.skip_teacher_eos:
+                teacher_answer_size = [size - 1 for size in teacher_answer_size]
+
+            distillation_losses: list[torch.Tensor] = []
+            matched_losses: list[torch.Tensor] = []
+            unmatched_losses: list[torch.Tensor] = []
+
+            try:
+                for i in range(outputs_student.logits.size(0)):
+                    student_start = student_answer_index[i]
+                    student_size = student_answer_size[i]
+                    teacher_start = teacher_answer_index[i]
+                    teacher_size = teacher_answer_size[i]
+
+                    if student_size <= 0 or teacher_size <= 0 or student_start <= 0 or teacher_start <= 0:
+                        distillation_losses.append(outputs_student.logits[i].sum() * 0.0)
+                        continue
+
+                    teacher_seq_len = int(teacher_attention_mask[i].sum().item())
+                    teacher_token_ids_full = teacher_input_ids[i, :teacher_seq_len].tolist()
+                    teacher_positions = list(range(teacher_start - 1, teacher_start - 1 + teacher_size))
+
+                    teacher_answer_logits = self.teacher_client.fetch_full_logprobs(
+                        teacher_token_ids_full,
+                        teacher_positions,
+                        device=outputs_student.logits.device,
+                        dtype=torch.float32,
+                    )
+
+                    student_answer_logits = outputs_student.logits[
+                        i, student_start - 1 : student_start - 1 + student_size, :
+                    ]
+                    student_token_ids = inputs["input_ids"][i, student_start : student_start + student_size].tolist()
+                    teacher_token_ids = teacher_input_ids[i, teacher_start : teacher_start + teacher_size].tolist()
+
+                    student_probs = F.softmax(student_answer_logits / self.uld_loss_fn.student_temperature, dim=-1)
+                    teacher_probs = F.softmax(teacher_answer_logits / self.uld_loss_fn.teacher_temperature, dim=-1)
+
+                    if self.uld_loss_fn.use_extended_uld:
+                        student_groups, teacher_groups = self.uld_loss_fn._build_alignment_groups_from_ids(
+                            student_token_ids, teacher_token_ids
+                        )
+                        student_aligned = self.uld_loss_fn._merge_probabilities_with_alignment_groups(
+                            student_probs, student_groups
+                        )
+                        teacher_aligned = self.uld_loss_fn._merge_probabilities_with_alignment_groups(
+                            teacher_probs, teacher_groups
+                        )
+                    else:
+                        min_length = min(len(student_token_ids), len(teacher_token_ids))
+                        student_aligned = student_probs[:min_length, :]
+                        teacher_aligned = teacher_probs[:min_length, :]
+
+                    if self.uld_loss_fn.use_hybrid_loss and self.uld_loss_fn._vocab_mapping is not None:
+                        aligned_loss = self.uld_loss_fn._compute_hybrid_uld_loss(student_aligned, teacher_aligned)
+                        if self.uld_loss_fn.last_matched_loss is not None:
+                            matched_losses.append(self.uld_loss_fn.last_matched_loss)
+                        if self.uld_loss_fn.last_unmatched_loss is not None:
+                            unmatched_losses.append(self.uld_loss_fn.last_unmatched_loss)
+                    else:
+                        student_sorted = student_aligned.sort(dim=-1, descending=True).values
+                        teacher_sorted = teacher_aligned.sort(dim=-1, descending=True).values
+
+                        student_vocab_size = student_sorted.size(-1)
+                        teacher_vocab_size = teacher_sorted.size(-1)
+                        max_vocab_size = max(student_vocab_size, teacher_vocab_size)
+                        if student_vocab_size < max_vocab_size:
+                            student_sorted = F.pad(student_sorted, (0, max_vocab_size - student_vocab_size))
+                        if teacher_vocab_size < max_vocab_size:
+                            teacher_sorted = F.pad(teacher_sorted, (0, max_vocab_size - teacher_vocab_size))
+
+                        aligned_loss = F.l1_loss(student_sorted, teacher_sorted, reduction="sum")
+                        aligned_loss /= max(1, student_aligned.size(0))
+
+                    distillation_losses.append(aligned_loss)
+            except Exception as exc:
+                warnings.warn(f"External teacher request failed; skipping batch. Error: {exc}")
+                loss = outputs_student.logits.sum() * 0.0
+                empty_cache()
+                return (loss, outputs_student) if return_outputs else loss
+
+            if not distillation_losses:
+                loss = outputs_student.logits.sum() * 0.0
+                empty_cache()
+                return (loss, outputs_student) if return_outputs else loss
+
+            distillation_loss = torch.stack(distillation_losses).mean()
+            loss = self.uld_loss_fn.distillation_weight * distillation_loss
+
+            if matched_losses and unmatched_losses:
+                self.uld_loss_fn.last_matched_loss = torch.stack(matched_losses).mean()
+                self.uld_loss_fn.last_unmatched_loss = torch.stack(unmatched_losses).mean()
+
+            if hasattr(self.uld_loss_fn, "last_matched_loss") and hasattr(self.uld_loss_fn, "last_unmatched_loss"):
+                try:
+                    ga = max(1, int(self.args.gradient_accumulation_steps))
+                except Exception:
+                    ga = 1
+                step_eq = 1.0 / ga
+                matched_val = (
+                    self.uld_loss_fn.last_matched_loss.item() if self.uld_loss_fn.last_matched_loss is not None else 0.0
+                )
+                unmatched_val = (
+                    self.uld_loss_fn.last_unmatched_loss.item()
+                    if self.uld_loss_fn.last_unmatched_loss is not None
+                    else 0.0
+                )
+
+                self._matched_sum += matched_val
+                self._unmatched_sum += unmatched_val
+                self._matched_step_eq += step_eq
+                self._unmatched_step_eq += step_eq
+
+            empty_cache()
+            return (loss, outputs_student) if return_outputs else loss
+
         if self.use_uld_loss and self.teacher_tokenizer is not None:
             if "original_prompt_text" in inputs and "original_completion_text" in inputs:
                 prompt_texts = inputs["original_prompt_text"]
