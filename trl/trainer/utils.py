@@ -20,8 +20,9 @@ import random
 import socket
 from collections.abc import Mapping, Sequence, Sized
 from dataclasses import dataclass
-from importlib.metadata import version
+from importlib.metadata import PackageNotFoundError, version
 from itertools import accumulate
+from pathlib import Path
 from typing import TypeVar
 
 import numpy as np
@@ -51,6 +52,19 @@ from transformers.utils import (
 )
 
 from ..trainer.model_config import ModelConfig
+
+
+def _safe_version(package: str) -> str:
+    try:
+        return version(package)
+    except PackageNotFoundError:
+        if package == "trl":
+            version_file = Path(__file__).resolve().parents[2] / "VERSION"
+            if version_file.exists():
+                resolved = version_file.read_text().strip()
+                if resolved:
+                    return resolved
+        return "unknown"
 
 
 if is_rich_available():
@@ -580,11 +594,11 @@ def generate_model_card(
         trainer_citation=trainer_citation,
         paper_title=paper_title,
         paper_id=paper_id,
-        trl_version=version("trl"),
-        transformers_version=version("transformers"),
-        pytorch_version=version("torch"),
-        datasets_version=version("datasets"),
-        tokenizers_version=version("tokenizers"),
+        trl_version=_safe_version("trl"),
+        transformers_version=_safe_version("transformers"),
+        pytorch_version=_safe_version("torch"),
+        datasets_version=_safe_version("datasets"),
+        tokenizers_version=_safe_version("tokenizers"),
     )
     return card
 
