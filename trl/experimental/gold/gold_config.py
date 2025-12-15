@@ -15,6 +15,8 @@
 from dataclasses import dataclass, field
 from typing import Any
 
+from transformers.utils import logging
+
 from transformers import TrainingArguments
 
 from ...trainer.sft_config import SFTConfig
@@ -48,6 +50,17 @@ class GOLDConfig(SFTConfig):
         teacher_tokenizer_name_or_path (`str` or `None`, *optional*, defaults to `None`):
             Tokenizer name or path for the teacher model. If None when using ULD loss, will use the same tokenizer as
             the student model (not recommended for cross-tokenizer distillation).
+        use_external_teacher_vllm (`bool`, *optional*, defaults to `False`):
+            Whether to fetch teacher full-vocab log-probabilities from an external vLLM teacher endpoint (instead of a
+            locally loaded teacher model). This mode is intended for label-free on-policy distillation.
+        teacher_vllm_base_url (`str`, *optional*, defaults to `"http://localhost:8000/v1/completions"`):
+            Full URL for the vLLM OpenAI-compatible completions endpoint that supports `full_logprobs`.
+        teacher_vllm_model_name (`str`, *optional*, defaults to `"qwen3-30b-3a-teacher"`):
+            Teacher model name passed to the vLLM endpoint.
+        teacher_vllm_timeout (`float`, *optional*, defaults to `10.0`):
+            Request timeout (in seconds) for the teacher endpoint.
+        teacher_vllm_max_retries (`int`, *optional*, defaults to `3`):
+            Maximum number of retries when the teacher endpoint request fails.
         disable_dropout (`bool`, *optional*, defaults to `True`):
             Whether to disable dropout in the model.
         seq_kd (`bool`, *optional*, defaults to `False`):
@@ -93,6 +106,8 @@ class GOLDConfig(SFTConfig):
             Enable vLLM sleep mode to offload student weights/cache during the optimizer step. Keeps GPU memory usage
             low, but waking the engine adds host–device transfer latency.
     """
+
+    logger = logging.get_logger(__name__)
 
     _VALID_DICT_FIELDS = TrainingArguments._VALID_DICT_FIELDS + ["teacher_model_init_kwargs"]
 
@@ -163,6 +178,33 @@ class GOLDConfig(SFTConfig):
             "help": "Tokenizer name or path for the teacher model. If None when using ULD loss, will use the same "
             "tokenizer as the student model (not recommended for cross-tokenizer distillation)."
         },
+    )
+
+    # External teacher (vLLM "full_logprobs teacher mode")
+    use_external_teacher_vllm: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Fetch teacher full-vocab log-probabilities from an external vLLM teacher endpoint instead of loading "
+                "a local teacher model. Intended for label-free, on-policy distillation."
+            )
+        },
+    )
+    teacher_vllm_base_url: str = field(
+        default="http://localhost:8000/v1/completions",
+        metadata={"help": "Full URL for the vLLM /v1/completions endpoint that supports full_logprobs."},
+    )
+    teacher_vllm_model_name: str = field(
+        default="qwen3-30b-3a-teacher",
+        metadata={"help": "Model name passed to the external teacher vLLM endpoint."},
+    )
+    teacher_vllm_timeout: float = field(
+        default=10.0,
+        metadata={"help": "Request timeout (in seconds) for the external teacher vLLM endpoint."},
+    )
+    teacher_vllm_max_retries: int = field(
+        default=3,
+        metadata={"help": "Maximum retries when calling the external teacher vLLM endpoint."},
     )
     disable_dropout: bool = field(
         default=True,
@@ -373,6 +415,44 @@ class GOLDConfig(SFTConfig):
 
     def __post_init__(self):
         super().__post_init__()
+
+        if self.use_external_teacher_vllm:
+            if self.teacher_tokenizer_name_or_path is None:
+                raise ValueError(
+                    "`teacher_tokenizer_name_or_path` must be set when `use_external_teacher_vllm=True` (external "
+                    "teacher mode requires a teacher tokenizer for vocabulary mapping)."
+                )
+
+            if not self.use_uld_loss:
+                self.logger.warning(
+                    "`use_external_teacher_vllm=True` requires `use_uld_loss=True`; enabling ULD loss automatically."
+                )
+                self.use_uld_loss = True
+            if not self.uld_use_hybrid_loss:
+                self.logger.warning(
+                    "`use_external_teacher_vllm=True` requires `uld_use_hybrid_loss=True`; enabling hybrid ULD "
+                    "loss automatically."
+                )
+                self.uld_use_hybrid_loss = True
+
+            if self.lmbda != 1.0:
+                self.logger.warning(
+                    "`use_external_teacher_vllm=True` requires on-policy-only distillation; forcing `lmbda=1.0`."
+                )
+                self.lmbda = 1.0
+
+            if self.uld_crossentropy_weight != 0.0:
+                self.logger.warning(
+                    "`use_external_teacher_vllm=True` is label-free; forcing `uld_crossentropy_weight=0.0`."
+                )
+                self.uld_crossentropy_weight = 0.0
+
+            if not self.teacher_vllm_base_url:
+                raise ValueError("`teacher_vllm_base_url` must be a non-empty URL when `use_external_teacher_vllm=True`.")
+            if self.teacher_vllm_timeout <= 0:
+                raise ValueError("`teacher_vllm_timeout` must be > 0 when `use_external_teacher_vllm=True`.")
+            if self.teacher_vllm_max_retries < 0:
+                raise ValueError("`teacher_vllm_max_retries` must be >= 0 when `use_external_teacher_vllm=True`.")
         # check lmbda and beta are in the range [0, 1]
         if self.lmbda < 0.0 or self.lmbda > 1.0:
             raise ValueError("lmbda must be in the range [0.0, 1.0].")
