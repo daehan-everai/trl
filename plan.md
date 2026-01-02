@@ -67,3 +67,5 @@ All values are log-softmax log-probabilities.
 10. [x] Add a runnable example that starts the dummy teacher server, loads `EverAI-AI/MagistSmall-Raven-DPO6-c`, and runs a short GOLD on-policy external-teacher training with WandB. (commit: 023f4e47)
 
 11. [x] Update the external-teacher client + dummy server/tests to parse OpenAI-style vLLM `choices[0].full_logprobs.logprobs` responses. (commit: a60b145e)
+
+12. [x] Update `techspec.md` to document the OpenAI-style `choices[0].full_logprobs.logprobs` response format. (commit: 3c28e98c)
