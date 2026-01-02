@@ -25,11 +25,18 @@ Request (minimal):
 Response (minimal):
 ```json
 {
-  "full_logprobs": {
-    "dtype": "fp16",
-    "shape": [3, 151936],
-    "data": "base64..."
-  }
+  "choices": [
+    {
+      "index": 0,
+      "text": "",
+      "full_logprobs": {
+        "dtype": "fp16",
+        "format": "base64_dense",
+        "positions": [0, 1, 2],
+        "logprobs": "base64..."
+      }
+    }
+  ]
 }
 ```
 
@@ -58,3 +65,5 @@ All values are log-softmax log-probabilities.
 9. [x] Allow running from source checkout by tolerating missing `trl` package metadata when generating a model card. (commit: 8f3f41a8)
 
 10. [x] Add a runnable example that starts the dummy teacher server, loads `EverAI-AI/MagistSmall-Raven-DPO6-c`, and runs a short GOLD on-policy external-teacher training with WandB. (commit: 023f4e47)
+
+11. [x] Update the external-teacher client + dummy server/tests to parse OpenAI-style vLLM `choices[0].full_logprobs.logprobs` responses. (commit: a60b145e)
