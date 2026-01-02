@@ -281,7 +281,26 @@ For a single training step:
        }
        ```
 
-     - Decode the response’s base64 `data` into a `[L_sub, V_t]` float16 matrix, then convert to `torch.Tensor` (e.g., float32) on GPU.
+     - Decode the response’s base64 `logprobs` into a `[L_sub, V_t]` float16 matrix, then convert to `torch.Tensor` (e.g., float32) on GPU:
+
+       ```json
+       {
+         "choices": [
+           {
+             "index": 0,
+             "text": "",
+             "full_logprobs": {
+               "dtype": "fp16",
+               "format": "base64_dense",
+               "positions": [0, 2],
+               "logprobs": "base64..."
+             }
+           }
+         ]
+       }
+       ```
+
+       If the response omits `shape`, infer `[len(positions), vocab_size]` from the teacher tokenizer vocab size.
 
    - The exact `positions` used should match the student’s target positions for next-token prediction (e.g., `pos-1` vs `pos`)—same as the original GOLD alignment.
 
