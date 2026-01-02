@@ -1403,6 +1403,7 @@ class GOLDTrainer(SFTTrainer):
                     teacher_answer_logits = self.teacher_client.fetch_full_logprobs(
                         teacher_token_ids_full,
                         teacher_positions,
+                        vocab_size=len(self.teacher_tokenizer),
                         device=outputs_student.logits.device,
                         dtype=torch.float32,
                     )

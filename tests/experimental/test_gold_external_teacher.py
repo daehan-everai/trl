@@ -104,11 +104,18 @@ class _DummyTeacherHandler(BaseHTTPRequestHandler):
 
         self._send_json(
             {
-                "full_logprobs": {
-                    "dtype": "fp16",
-                    "shape": [rows, vocab_size],
-                    "data": data_b64,
-                }
+                "choices": [
+                    {
+                        "index": 0,
+                        "text": "",
+                        "full_logprobs": {
+                            "dtype": "fp16",
+                            "format": "base64_dense",
+                            "positions": positions,
+                            "logprobs": data_b64,
+                        },
+                    }
+                ]
             }
         )
 

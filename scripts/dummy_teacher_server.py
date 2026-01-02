@@ -72,11 +72,18 @@ def build_app(*, vocab_size: int, seed: int | None = None):
         logprobs = torch.log_softmax(logits, dim=-1).to(dtype=torch.float16)
 
         return {
-            "full_logprobs": {
-                "dtype": "fp16",
-                "shape": [rows, vocab_size],
-                "data": _encode_base64_dense_fp16(logprobs),
-            }
+            "choices": [
+                {
+                    "index": 0,
+                    "text": "",
+                    "full_logprobs": {
+                        "dtype": "fp16",
+                        "format": "base64_dense",
+                        "positions": positions,
+                        "logprobs": _encode_base64_dense_fp16(logprobs),
+                    },
+                }
+            ]
         }
 
     return app

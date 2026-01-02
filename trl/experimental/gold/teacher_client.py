@@ -68,7 +68,8 @@ class VLLMTeacherClient:
     Minimal HTTP client for the vLLM "full_logprobs teacher mode" endpoint.
 
     The endpoint is expected to accept an OpenAI-compatible `/v1/completions` request with a `full_logprobs` field and
-    return a `base64_dense` fp16 matrix of log-softmax log-probabilities for each requested position.
+    return a `base64_dense` fp16 matrix of log-softmax log-probabilities for each requested position. The response can
+    either be a top-level `full_logprobs` payload or an OpenAI-style `choices[0].full_logprobs` payload.
     """
 
     def __init__(self, config: VLLMTeacherClientConfig):
@@ -101,6 +102,7 @@ class VLLMTeacherClient:
         token_ids: list[int],
         positions: list[int],
         *,
+        vocab_size: int | None = None,
         device: torch.device | None = None,
         dtype: torch.dtype = torch.float32,
     ) -> torch.Tensor:
@@ -116,11 +118,25 @@ class VLLMTeacherClient:
         for attempt in range(self.config.max_retries + 1):
             try:
                 response = self._post_json(payload)
-                full_logprobs = response["full_logprobs"]
-                if full_logprobs.get("dtype") != "fp16":
-                    raise ValueError(f"Unsupported full_logprobs dtype: {full_logprobs.get('dtype')}")
-                shape = tuple(full_logprobs["shape"])
-                tensor = decode_base64_dense_fp16(full_logprobs["data"], shape=shape)  # CPU fp16
+                full_logprobs = self._extract_full_logprobs(response)
+                dtype_tag = full_logprobs.get("dtype", "fp16")
+                if dtype_tag != "fp16":
+                    raise ValueError(f"Unsupported full_logprobs dtype: {dtype_tag}")
+
+                data_b64 = full_logprobs.get("data") or full_logprobs.get("logprobs")
+                if data_b64 is None:
+                    raise ValueError("Missing full_logprobs base64 payload (expected `data` or `logprobs`).")
+
+                shape = full_logprobs.get("shape")
+                if shape is None:
+                    if vocab_size is None:
+                        raise ValueError(
+                            "`vocab_size` must be provided when `full_logprobs.shape` is missing from the response."
+                        )
+                    shape = (len(positions), int(vocab_size))
+                shape = tuple(shape)
+
+                tensor = decode_base64_dense_fp16(data_b64, shape=shape)  # CPU fp16
                 tensor = tensor.to(device=device, dtype=dtype) if device is not None else tensor.to(dtype=dtype)
                 return tensor
             except Exception as exc:
@@ -130,6 +146,18 @@ class VLLMTeacherClient:
                 time.sleep(0.25 * (2**attempt))
 
         raise RuntimeError("Teacher endpoint request failed after retries.") from last_exc
+
+    def _extract_full_logprobs(self, response: dict[str, Any]) -> dict[str, Any]:
+        if "full_logprobs" in response:
+            return response["full_logprobs"]
+
+        choices = response.get("choices")
+        if isinstance(choices, list) and choices:
+            choice = choices[0]
+            if isinstance(choice, dict) and "full_logprobs" in choice:
+                return choice["full_logprobs"]
+
+        raise ValueError("Teacher response missing `full_logprobs` payload.")
 
     def _post_json(self, payload: dict[str, Any]) -> dict[str, Any]:
         if is_requests_available():
