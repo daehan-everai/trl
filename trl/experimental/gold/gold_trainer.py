@@ -1090,10 +1090,17 @@ class GOLDTrainer(SFTTrainer):
                 """Modified tokenization function that preserves original text."""
                 result = {}
 
+                def strip_special_tokens(text: str) -> str:
+                    if not text:
+                        return text
+                    token_ids = processing_class(text=text, add_special_tokens=False)["input_ids"]
+                    return processing_class.decode(
+                        token_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
+                    )
+
                 if "prompt" in example:  # prompt-completion case
                     # Store original text
                     result["original_prompt_text"] = example["prompt"]
-                    result["original_completion_text"] = example["completion"]
 
                     if is_conversational(example):
                         prompt_ids = processing_class.apply_chat_template(
@@ -1116,6 +1123,11 @@ class GOLDTrainer(SFTTrainer):
                             "token handling. Verify that the tokenizer is processing text consistently.",
                             stacklevel=2,
                         )
+
+                    completion_ids = prompt_completion_ids[len(prompt_ids) :]
+                    result["original_completion_text"] = processing_class.decode(
+                        completion_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
+                    )
 
                     # Create a completion mask
                     completion_mask = [0] * len(prompt_ids) + [1] * (len(prompt_completion_ids) - len(prompt_ids))
@@ -1166,6 +1178,8 @@ class GOLDTrainer(SFTTrainer):
                                     else assistant_content
                                 )
 
+                            completion_text = strip_special_tokens(completion_text)
+
                             # Store original text for cross-tokenizer distillation
                             result["original_prompt_text"] = prompt_text
                             result["original_completion_text"] = completion_text
@@ -1175,7 +1189,7 @@ class GOLDTrainer(SFTTrainer):
                                 messages, tokenize=False, **example.get("chat_template_kwargs", {})
                             )
                             result["original_prompt_text"] = ""
-                            result["original_completion_text"] = full_text
+                            result["original_completion_text"] = strip_special_tokens(full_text)
 
                         # Process the conversation normally
                         processed = processing_class.apply_chat_template(
@@ -1199,7 +1213,9 @@ class GOLDTrainer(SFTTrainer):
                     else:
                         # For regular language modeling, store the full text as completion and empty prompt
                         result["original_prompt_text"] = ""
-                        result["original_completion_text"] = example.get(dataset_text_field, example.get("text", ""))
+                        result["original_completion_text"] = strip_special_tokens(
+                            example.get(dataset_text_field, example.get("text", ""))
+                        )
 
                         tokenized = processing_class(text=example[dataset_text_field])
                         result.update(
@@ -1367,6 +1383,12 @@ class GOLDTrainer(SFTTrainer):
             student_labels = inputs["labels"].clone()
             if hasattr(self.processing_class, "pad_token_id") and self.processing_class.pad_token_id is not None:
                 student_labels[student_labels == self.processing_class.pad_token_id] = -100
+            special_ids = getattr(self.processing_class, "all_special_ids", None)
+            if special_ids:
+                special_ids_tensor = torch.tensor(
+                    special_ids, device=inputs["input_ids"].device, dtype=inputs["input_ids"].dtype
+                )
+                student_labels[torch.isin(inputs["input_ids"], special_ids_tensor)] = -100
 
             # Also mask pad tokens in teacher labels for consistency
             if self.teacher_tokenizer.pad_token_id is not None:
@@ -1776,7 +1798,7 @@ class GOLDTrainer(SFTTrainer):
             completion_texts.append(
                 self.processing_class.decode(
                     completion_tokens.tolist(),
-                    skip_special_tokens=False,
+                    skip_special_tokens=True,
                     clean_up_tokenization_spaces=False,
                 )
             )
@@ -1944,7 +1966,9 @@ class GOLDTrainer(SFTTrainer):
         # Extract completion texts from the generated completion IDs
         completion_texts = []
         for comp_ids in completion_ids:
-            completion_text = self.processing_class.decode(comp_ids, skip_special_tokens=False)
+            completion_text = self.processing_class.decode(
+                comp_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
+            )
             completion_texts.append(completion_text)
 
         return new_input_ids, new_attention_mask, new_labels, prompts_text_with_special, completion_texts

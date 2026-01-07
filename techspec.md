@@ -87,6 +87,7 @@ Out of scope:
   \]
 
 - Answer token positions (completion tokens after the prompt): \( \mathcal{T} \)
+  - \( \mathcal{T} \) covers assistant **content tokens only** (chat-template markers and EOS are excluded).
 
 We assume:
 
@@ -259,6 +260,8 @@ For a single training step:
      ```
 
    - These positions define the set \( \mathcal{T} \).
+   - For distillation, **only assistant content tokens** are included in \( \mathcal{T} \); chat-template markers and EOS
+     are stripped/ignored before requesting teacher logprobs.
 
 3. **Teacher log-probabilities from vLLM**
 
