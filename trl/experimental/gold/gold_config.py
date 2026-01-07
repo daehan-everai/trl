@@ -61,6 +61,8 @@ class GOLDConfig(SFTConfig):
             Request timeout (in seconds) for the teacher endpoint.
         teacher_vllm_max_retries (`int`, *optional*, defaults to `3`):
             Maximum number of retries when the teacher endpoint request fails.
+        teacher_vllm_fail_on_error (`bool`, *optional*, defaults to `False`):
+            If True, raise immediately when the external teacher request fails instead of skipping the batch.
         disable_dropout (`bool`, *optional*, defaults to `True`):
             Whether to disable dropout in the model.
         seq_kd (`bool`, *optional*, defaults to `False`):
@@ -205,6 +207,32 @@ class GOLDConfig(SFTConfig):
     teacher_vllm_max_retries: int = field(
         default=3,
         metadata={"help": "Maximum retries when calling the external teacher vLLM endpoint."},
+    )
+    teacher_vllm_fail_on_error: bool = field(
+        default=False,
+        metadata={"help": "If True, raise when the external teacher request fails instead of skipping the batch."},
+    )
+    teacher_vllm_max_input_tokens: int | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "If set, truncate teacher input token ids from the left to fit within this limit before calling "
+                "the external vLLM endpoint. Useful for endpoints with a lower max context length than the "
+                "teacher tokenizer's model_max_length."
+            )
+        },
+    )
+    teacher_vllm_full_logprobs_format: str = field(
+        default="top_p",
+        metadata={"help": "full_logprobs response format from vLLM (e.g., 'top_p' or 'base64_dense')."},
+    )
+    teacher_vllm_full_logprobs_top_p: float | None = field(
+        default=0.9999,
+        metadata={"help": "Top-p cutoff to request when using sparse full_logprobs format."},
+    )
+    teacher_vllm_full_logprobs_max_top_k: int | None = field(
+        default=512,
+        metadata={"help": "Maximum top-k per position to request when using sparse full_logprobs format."},
     )
     disable_dropout: bool = field(
         default=True,
@@ -453,6 +481,22 @@ class GOLDConfig(SFTConfig):
                 raise ValueError("`teacher_vllm_timeout` must be > 0 when `use_external_teacher_vllm=True`.")
             if self.teacher_vllm_max_retries < 0:
                 raise ValueError("`teacher_vllm_max_retries` must be >= 0 when `use_external_teacher_vllm=True`.")
+            if self.teacher_vllm_max_input_tokens is not None and self.teacher_vllm_max_input_tokens <= 0:
+                raise ValueError("`teacher_vllm_max_input_tokens` must be > 0 when set.")
+            if self.teacher_vllm_full_logprobs_format not in {"base64_dense", "top_p"}:
+                raise ValueError("`teacher_vllm_full_logprobs_format` must be 'base64_dense' or 'top_p'.")
+            if (
+                self.teacher_vllm_full_logprobs_format == "top_p"
+                and self.teacher_vllm_full_logprobs_top_p is not None
+                and not (0.0 < self.teacher_vllm_full_logprobs_top_p <= 1.0)
+            ):
+                raise ValueError("`teacher_vllm_full_logprobs_top_p` must be within (0, 1].")
+            if (
+                self.teacher_vllm_full_logprobs_format == "top_p"
+                and self.teacher_vllm_full_logprobs_max_top_k is not None
+                and self.teacher_vllm_full_logprobs_max_top_k <= 0
+            ):
+                raise ValueError("`teacher_vllm_full_logprobs_max_top_k` must be > 0.")
         # check lmbda and beta are in the range [0, 1]
         if self.lmbda < 0.0 or self.lmbda > 1.0:
             raise ValueError("lmbda must be in the range [0.0, 1.0].")

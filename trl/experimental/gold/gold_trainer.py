@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 import os
 import random
 import textwrap
@@ -799,6 +800,9 @@ class GOLDTrainer(SFTTrainer):
                     model_name=args.teacher_vllm_model_name,
                     timeout=args.teacher_vllm_timeout,
                     max_retries=args.teacher_vllm_max_retries,
+                    full_logprobs_format=args.teacher_vllm_full_logprobs_format,
+                    full_logprobs_top_p=args.teacher_vllm_full_logprobs_top_p,
+                    full_logprobs_max_top_k=args.teacher_vllm_full_logprobs_max_top_k,
                 )
             )
 
@@ -1090,17 +1094,10 @@ class GOLDTrainer(SFTTrainer):
                 """Modified tokenization function that preserves original text."""
                 result = {}
 
-                def strip_special_tokens(text: str) -> str:
-                    if not text:
-                        return text
-                    token_ids = processing_class(text=text, add_special_tokens=False)["input_ids"]
-                    return processing_class.decode(
-                        token_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
-                    )
-
                 if "prompt" in example:  # prompt-completion case
                     # Store original text
                     result["original_prompt_text"] = example["prompt"]
+                    result["original_completion_text"] = example["completion"]
 
                     if is_conversational(example):
                         prompt_ids = processing_class.apply_chat_template(
@@ -1123,11 +1120,6 @@ class GOLDTrainer(SFTTrainer):
                             "token handling. Verify that the tokenizer is processing text consistently.",
                             stacklevel=2,
                         )
-
-                    completion_ids = prompt_completion_ids[len(prompt_ids) :]
-                    result["original_completion_text"] = processing_class.decode(
-                        completion_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
-                    )
 
                     # Create a completion mask
                     completion_mask = [0] * len(prompt_ids) + [1] * (len(prompt_completion_ids) - len(prompt_ids))
@@ -1178,8 +1170,6 @@ class GOLDTrainer(SFTTrainer):
                                     else assistant_content
                                 )
 
-                            completion_text = strip_special_tokens(completion_text)
-
                             # Store original text for cross-tokenizer distillation
                             result["original_prompt_text"] = prompt_text
                             result["original_completion_text"] = completion_text
@@ -1189,7 +1179,7 @@ class GOLDTrainer(SFTTrainer):
                                 messages, tokenize=False, **example.get("chat_template_kwargs", {})
                             )
                             result["original_prompt_text"] = ""
-                            result["original_completion_text"] = strip_special_tokens(full_text)
+                            result["original_completion_text"] = full_text
 
                         # Process the conversation normally
                         processed = processing_class.apply_chat_template(
@@ -1213,9 +1203,7 @@ class GOLDTrainer(SFTTrainer):
                     else:
                         # For regular language modeling, store the full text as completion and empty prompt
                         result["original_prompt_text"] = ""
-                        result["original_completion_text"] = strip_special_tokens(
-                            example.get(dataset_text_field, example.get("text", ""))
-                        )
+                        result["original_completion_text"] = example.get(dataset_text_field, example.get("text", ""))
 
                         tokenized = processing_class(text=example[dataset_text_field])
                         result.update(
@@ -1365,7 +1353,43 @@ class GOLDTrainer(SFTTrainer):
                 full_sequences = inputs["input_ids"]
                 full_texts = self.processing_class.batch_decode(full_sequences, skip_special_tokens=False)
                 prompt_texts = self.processing_class.batch_decode(inputs["prompts"], skip_special_tokens=False)
-                completion_texts = [full.replace(prompt, "", 1) for full, prompt in zip(full_texts, prompt_texts, strict=True)]
+                completion_texts = [
+                    full.replace(prompt, "", 1) for full, prompt in zip(full_texts, prompt_texts, strict=True)
+                ]
+
+            # Create properly masked student labels early (used for truncation + loss).
+            student_labels = inputs["labels"].clone()
+            if hasattr(self.processing_class, "pad_token_id") and self.processing_class.pad_token_id is not None:
+                student_labels[student_labels == self.processing_class.pad_token_id] = -100
+
+            student_answer_index, student_answer_size = self.uld_loss_fn._get_start_and_size_answers(student_labels)
+            if self.uld_loss_fn.skip_student_eos:
+                student_answer_size = [size - 1 for size in student_answer_size]
+
+            max_teacher_tokens = getattr(self.args, "teacher_vllm_max_input_tokens", None)
+            if max_teacher_tokens is not None:
+                max_teacher_tokens = int(max_teacher_tokens)
+                prompt_texts = list(prompt_texts)
+                for i in range(len(prompt_texts)):
+                    student_start = student_answer_index[i]
+                    student_size = student_answer_size[i]
+                    if student_start <= 0 or student_size <= 0:
+                        continue
+                    # Keep margin proportional to completion length using student token counts.
+                    max_prompt_tokens = max_teacher_tokens - int(math.ceil(1.5 * student_size))
+                    if max_prompt_tokens < 0:
+                        max_prompt_tokens = 0
+                    if student_start > max_prompt_tokens:
+                        prompt_ids = inputs["input_ids"][i, :student_start].tolist()
+                        if max_prompt_tokens > 0:
+                            prompt_ids = prompt_ids[-max_prompt_tokens:]
+                        else:
+                            prompt_ids = []
+                        prompt_texts[i] = self.processing_class.decode(
+                            prompt_ids,
+                            skip_special_tokens=False,
+                            clean_up_tokenization_spaces=False,
+                        )
 
             teacher_input_ids, teacher_labels, teacher_attention_mask, _ = build_teacher_inputs_from_texts(
                 self.teacher_tokenizer,
@@ -1379,27 +1403,13 @@ class GOLDTrainer(SFTTrainer):
                 use_cache=False,
             )
 
-            # Create properly masked student labels
-            student_labels = inputs["labels"].clone()
-            if hasattr(self.processing_class, "pad_token_id") and self.processing_class.pad_token_id is not None:
-                student_labels[student_labels == self.processing_class.pad_token_id] = -100
-            special_ids = getattr(self.processing_class, "all_special_ids", None)
-            if special_ids:
-                special_ids_tensor = torch.tensor(
-                    special_ids, device=inputs["input_ids"].device, dtype=inputs["input_ids"].dtype
-                )
-                student_labels[torch.isin(inputs["input_ids"], special_ids_tensor)] = -100
-
             # Also mask pad tokens in teacher labels for consistency
             if self.teacher_tokenizer.pad_token_id is not None:
                 teacher_labels = teacher_labels.clone()
                 teacher_labels[teacher_labels == self.teacher_tokenizer.pad_token_id] = -100
 
-            student_answer_index, student_answer_size = self.uld_loss_fn._get_start_and_size_answers(student_labels)
             teacher_answer_index, teacher_answer_size = self.uld_loss_fn._get_start_and_size_answers(teacher_labels)
 
-            if self.uld_loss_fn.skip_student_eos:
-                student_answer_size = [size - 1 for size in student_answer_size]
             if self.uld_loss_fn.skip_teacher_eos:
                 teacher_answer_size = [size - 1 for size in teacher_answer_size]
 
@@ -1418,9 +1428,26 @@ class GOLDTrainer(SFTTrainer):
                         distillation_losses.append(outputs_student.logits[i].sum() * 0.0)
                         continue
 
-                    teacher_seq_len = int(teacher_attention_mask[i].sum().item())
-                    teacher_token_ids_full = teacher_input_ids[i, :teacher_seq_len].tolist()
+                    teacher_token_ids_full = teacher_input_ids[i, : int(teacher_attention_mask[i].sum().item())].tolist()
+                    teacher_seq_len = len(teacher_token_ids_full)
                     teacher_positions = list(range(teacher_start - 1, teacher_start - 1 + teacher_size))
+                    teacher_positions = [pos for pos in teacher_positions if pos >= 1]
+                    if teacher_positions:
+                        teacher_positions = teacher_positions[1:]
+                    max_positions = None
+                    if self.args.max_completion_length is not None:
+                        max_positions = int(self.args.max_completion_length)
+                    if max_positions is not None:
+                        max_positions = min(max_positions, int(student_size))
+                        teacher_positions = teacher_positions[:max_positions]
+                    if max_teacher_tokens is not None and teacher_seq_len > max_teacher_tokens:
+                        trim_offset = teacher_seq_len - max_teacher_tokens
+                        teacher_token_ids_full = teacher_token_ids_full[trim_offset:]
+                        teacher_positions = [pos - trim_offset for pos in teacher_positions if pos >= trim_offset]
+                        if not teacher_positions:
+                            distillation_losses.append(outputs_student.logits[i].sum() * 0.0)
+                            continue
+                    teacher_size = len(teacher_positions)
 
                     teacher_answer_logits = self.teacher_client.fetch_full_logprobs(
                         teacher_token_ids_full,
@@ -1477,6 +1504,8 @@ class GOLDTrainer(SFTTrainer):
 
                     distillation_losses.append(aligned_loss)
             except Exception as exc:
+                if getattr(self.args, "teacher_vllm_fail_on_error", False):
+                    raise RuntimeError("External teacher request failed; aborting training.") from exc
                 warnings.warn(f"External teacher request failed; skipping batch. Error: {exc}")
                 loss = outputs_student.logits.sum() * 0.0
                 empty_cache()
@@ -1798,7 +1827,7 @@ class GOLDTrainer(SFTTrainer):
             completion_texts.append(
                 self.processing_class.decode(
                     completion_tokens.tolist(),
-                    skip_special_tokens=True,
+                    skip_special_tokens=False,
                     clean_up_tokenization_spaces=False,
                 )
             )
@@ -1966,9 +1995,7 @@ class GOLDTrainer(SFTTrainer):
         # Extract completion texts from the generated completion IDs
         completion_texts = []
         for comp_ids in completion_ids:
-            completion_text = self.processing_class.decode(
-                comp_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
-            )
+            completion_text = self.processing_class.decode(comp_ids, skip_special_tokens=False)
             completion_texts.append(completion_text)
 
         return new_input_ids, new_attention_mask, new_labels, prompts_text_with_special, completion_texts
