@@ -69,3 +69,5 @@ All values are log-softmax log-probabilities.
 11. [x] Update the external-teacher client + dummy server/tests to parse OpenAI-style vLLM `choices[0].full_logprobs.logprobs` responses. (commit: a60b145e)
 
 12. [x] Update `techspec.md` to document the OpenAI-style `choices[0].full_logprobs.logprobs` response format. (commit: 3c28e98c)
+
+13. [x] Distill content-only completion tokens (strip special tokens from completion text and mask student specials for alignment). (commit: 3559d91c)
