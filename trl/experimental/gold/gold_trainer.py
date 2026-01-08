@@ -1541,9 +1541,6 @@ class GOLDTrainer(SFTTrainer):
                     teacher_token_ids_full = teacher_input_ids[i, : int(teacher_attention_mask[i].sum().item())].tolist()
                     teacher_seq_len = len(teacher_token_ids_full)
                     teacher_positions = list(range(teacher_start - 1, teacher_start - 1 + teacher_size))
-                    teacher_positions = [pos for pos in teacher_positions if pos >= 1]
-                    if teacher_positions:
-                        teacher_positions = teacher_positions[1:]
                     max_positions = None
                     if self.args.max_completion_length is not None:
                         max_positions = int(self.args.max_completion_length)
