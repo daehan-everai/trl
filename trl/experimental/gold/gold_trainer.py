@@ -35,7 +35,7 @@ from transformers import AutoTokenizer, is_bitsandbytes_available
 from transformers.data.data_collator import DataCollator
 from transformers.feature_extraction_utils import FeatureExtractionMixin
 from transformers.generation.configuration_utils import GenerationConfig
-from transformers.generation.stopping_criteria import StoppingCriteria, StoppingCriteriaList
+from transformers.generation.stopping_criteria import StopStringCriteria, StoppingCriteria, StoppingCriteriaList
 from transformers.image_processing_utils import BaseImageProcessor
 from transformers.integrations.integration_utils import is_wandb_available
 from transformers.modeling_utils import PreTrainedModel
@@ -206,6 +206,35 @@ class StopSequenceCriteria(StoppingCriteria):
             match = match & (match_start >= start_lengths)
             is_done = is_done | match
         return is_done
+
+
+class StopAfterPromptCriteria(StoppingCriteria):
+    def __init__(self, tokenizer, stop_strings: list[str], start_lengths: list[int] | int):
+        super().__init__()
+        self.stop_criteria = StopStringCriteria(tokenizer, stop_strings)
+        if isinstance(start_lengths, int):
+            self.start_lengths = None
+            self.start_length = start_lengths
+        else:
+            self.start_lengths = torch.tensor(start_lengths, dtype=torch.long)
+            self.start_length = None
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> torch.BoolTensor:
+        stop = self.stop_criteria(input_ids, scores, **kwargs)
+        if self.start_lengths is None:
+            if input_ids.shape[1] <= self.start_length:
+                return torch.zeros_like(stop)
+            return stop
+        start_lengths = self.start_lengths.to(input_ids.device)
+        if start_lengths.numel() != input_ids.shape[0]:
+            start_lengths = start_lengths[: input_ids.shape[0]]
+        mask = torch.full(
+            (input_ids.shape[0],),
+            input_ids.shape[1],
+            dtype=torch.long,
+            device=input_ids.device,
+        ) > start_lengths
+        return stop & mask
 
 
 def build_teacher_inputs_from_texts(
@@ -916,27 +945,26 @@ class GOLDTrainer(SFTTrainer):
         ):
             self.generation_config.eos_token_id = self.model.generation_config.eos_token_id
 
-        self.stop_sequences = []
+        self.stop_sequences_trim = []
         self.stop_sequences_vllm = []
+        self.stop_strings_generate = []
         chat_template = getattr(self.processing_class, "chat_template", None)
         if chat_template and "<|im_end|>" in chat_template:
-            self.stop_sequences.append("<|im_end|>")
-            self.stop_sequences.append("<|")
+            self.stop_sequences_trim.append("<|im_end|>")
             self.stop_sequences_vllm.append("<|im_end|>")
+            self.stop_strings_generate.append("<|")
 
-        self.stop_sequence_ids = []
-        for seq in self.stop_sequences:
+        self.stop_sequence_ids_trim = []
+        for seq in self.stop_sequences_trim:
             try:
                 seq_ids = self.processing_class.encode(seq, add_special_tokens=False)
             except Exception:
                 seq_ids = []
             if seq_ids:
-                self.stop_sequence_ids.append(seq_ids)
+                self.stop_sequence_ids_trim.append(seq_ids)
 
-        if self.stop_sequence_ids:
+        if self.stop_sequence_ids_trim:
             self.generation_config.eos_token_id = None
-
-        self.stop_sequence_ids_trim = self.stop_sequence_ids
 
         # Initialize the metrics
         self._metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
@@ -1844,13 +1872,13 @@ class GOLDTrainer(SFTTrainer):
             else:
                 prompt_sequences = [row.detach().cpu().tolist() for row in prompts_tensor]
             stopping_criteria = None
-            if self.stop_sequence_ids:
+            if self.stop_strings_generate:
                 if prompt_mask is not None:
                     start_lengths = [int(mask.sum().item()) for mask in prompt_mask]
                 else:
                     start_lengths = [int(len(row)) for row in prompt_sequences]
                 stopping_criteria = StoppingCriteriaList(
-                    [StopSequenceCriteria(self.stop_sequence_ids, start_lengths)]
+                    [StopAfterPromptCriteria(self.processing_class, self.stop_strings_generate, start_lengths)]
                 )
             generation_kwargs = {"generation_config": generation_config}
             if stopping_criteria is not None:
@@ -1866,10 +1894,10 @@ class GOLDTrainer(SFTTrainer):
             generated_tokens = torch.stack([torch.tensor(ids, device=model.device) for ids in completion_ids])
         else:
             stopping_criteria = None
-            if self.stop_sequence_ids:
+            if self.stop_strings_generate:
                 start_length = int(inputs["prompts"].shape[1])
                 stopping_criteria = StoppingCriteriaList(
-                    [StopSequenceCriteria(self.stop_sequence_ids, start_length)]
+                    [StopAfterPromptCriteria(self.processing_class, self.stop_strings_generate, start_length)]
                 )
             generation_kwargs = {
                 "input_ids": inputs["prompts"],
