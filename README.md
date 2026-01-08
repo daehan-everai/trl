@@ -85,6 +85,17 @@ Notes:
 - The probability is applied to the stop token; other tokens are suppressed in the teacher prior.
 - For different chat templates, ensure the stop string matches the student/teacher templates.
 
+## Teacher system prompt (optional)
+You can inject a system instruction into the teacher prompt to steer the teacher distributions without altering
+the student prompt formatting:
+```bash
+--teacher-system-prompt "respond in french, as bitchy as possible. at least 2 sentence with actions embraced with asterisks(*)"
+```
+
+Notes:
+- The prompt is prepended to the teacher prompt with a configurable separator (`--teacher-system-prompt-sep`, default: blank line).
+- This only affects the teacher logprobs; the student still sees the original prompt.
+
 ## Quick sanity (1-step, local dummy teacher)
 Use this to validate the training loop without relying on an external vLLM endpoint (dummy teacher only supports `base64_dense`):
 ```bash

@@ -338,6 +338,14 @@ class GOLDConfig(SFTConfig):
         default=0.99,
         metadata={"help": "Target probability for the forced stop token prior (remainder spread uniformly)."},
     )
+    teacher_prompt_prefix: str | None = field(
+        default=None,
+        metadata={"help": "Optional prefix injected into teacher prompts (e.g., a system instruction)."},
+    )
+    teacher_prompt_prefix_sep: str = field(
+        default="\n\n",
+        metadata={"help": "Separator between teacher_prompt_prefix and the original prompt text."},
+    )
 
     # transformers paged attention
     use_transformers_paged: bool = field(

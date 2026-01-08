@@ -973,6 +973,8 @@ class GOLDTrainer(SFTTrainer):
 
         self.uld_force_stop_token = getattr(args, "uld_force_stop_token", False)
         self.uld_force_stop_token_prob = getattr(args, "uld_force_stop_token_prob", 0.99)
+        self.teacher_prompt_prefix = getattr(args, "teacher_prompt_prefix", None)
+        self.teacher_prompt_prefix_sep = getattr(args, "teacher_prompt_prefix_sep", "\n\n")
         self.stop_sequence_ids_teacher = []
         if self.teacher_tokenizer is not None and self.stop_sequences_trim:
             for seq in self.stop_sequences_trim:
@@ -1499,6 +1501,10 @@ class GOLDTrainer(SFTTrainer):
                             skip_special_tokens=False,
                             clean_up_tokenization_spaces=False,
                         )
+
+            if self.teacher_prompt_prefix:
+                sep = self.teacher_prompt_prefix_sep or ""
+                prompt_texts = [f"{self.teacher_prompt_prefix}{sep}{prompt}" for prompt in prompt_texts]
 
             teacher_input_ids, teacher_labels, teacher_attention_mask, _ = build_teacher_inputs_from_texts(
                 self.teacher_tokenizer,

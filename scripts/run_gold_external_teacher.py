@@ -305,6 +305,16 @@ def main() -> None:
         default=None,
         help="Max teacher input tokens for external endpoint (truncates from left).",
     )
+    parser.add_argument(
+        "--teacher-system-prompt",
+        default=None,
+        help="Optional system prompt prefix injected into teacher prompts.",
+    )
+    parser.add_argument(
+        "--teacher-system-prompt-sep",
+        default="\\n\\n",
+        help="Separator between teacher system prompt and the original prompt.",
+    )
     parser.add_argument("--teacher-preflight-requests", type=int, default=3)
     parser.add_argument("--teacher-preflight-min-success", type=int, default=1)
     parser.add_argument("--output-dir", default="runs/gold-external-teacher")
@@ -538,6 +548,8 @@ def main() -> None:
             vllm_enable_sleep_mode=args.vllm_enable_sleep_mode,
             uld_force_stop_token=args.force_stop_token,
             uld_force_stop_token_prob=args.force_stop_token_prob,
+            teacher_prompt_prefix=args.teacher_system_prompt,
+            teacher_prompt_prefix_sep=args.teacher_system_prompt_sep,
         )
         if args.disable_unmatched_loss:
             train_args.uld_hybrid_matched_weight = 1.0
