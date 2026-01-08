@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import math
 import os
 import random
@@ -34,6 +35,7 @@ from transformers import AutoTokenizer, is_bitsandbytes_available
 from transformers.data.data_collator import DataCollator
 from transformers.feature_extraction_utils import FeatureExtractionMixin
 from transformers.generation.configuration_utils import GenerationConfig
+from transformers.generation.stopping_criteria import StoppingCriteria, StoppingCriteriaList
 from transformers.image_processing_utils import BaseImageProcessor
 from transformers.integrations.integration_utils import is_wandb_available
 from transformers.modeling_utils import PreTrainedModel
@@ -167,6 +169,23 @@ def print_prompt_completions_sample_uld(
 
     panel = Panel(table, expand=False, title=f"Step {step}", border_style="bold white")
     console.print(panel)
+
+
+class StopSequenceCriteria(StoppingCriteria):
+    def __init__(self, stop_sequences: list[list[int]]):
+        super().__init__()
+        self.stop_sequences = [torch.tensor(seq, dtype=torch.long) for seq in stop_sequences if seq]
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> torch.BoolTensor:
+        if not self.stop_sequences:
+            return torch.zeros((input_ids.shape[0],), dtype=torch.bool, device=input_ids.device)
+        is_done = torch.zeros((input_ids.shape[0],), dtype=torch.bool, device=input_ids.device)
+        for seq in self.stop_sequences:
+            if input_ids.shape[1] < seq.numel():
+                continue
+            seq = seq.to(input_ids.device)
+            is_done = is_done | (input_ids[:, -seq.numel() :] == seq).all(dim=1)
+        return is_done
 
 
 def build_teacher_inputs_from_texts(
@@ -877,6 +896,23 @@ class GOLDTrainer(SFTTrainer):
         ):
             self.generation_config.eos_token_id = self.model.generation_config.eos_token_id
 
+        self.stop_sequences = []
+        chat_template = getattr(self.processing_class, "chat_template", None)
+        if chat_template and "<|im_end|>" in chat_template:
+            self.stop_sequences.append("<|im_end|>")
+
+        self.stop_sequence_ids = []
+        for seq in self.stop_sequences:
+            try:
+                seq_ids = self.processing_class.encode(seq, add_special_tokens=False)
+            except Exception:
+                seq_ids = []
+            if seq_ids:
+                self.stop_sequence_ids.append(seq_ids)
+
+        if self.stop_sequence_ids:
+            self.generation_config.eos_token_id = None
+
         # Initialize the metrics
         self._metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
         self._total_train_tokens = 0
@@ -957,7 +993,9 @@ class GOLDTrainer(SFTTrainer):
                     revision=self.model_revision,
                     tensor_parallel_size=self.vllm_tensor_parallel_size,
                     gpu_memory_utilization=self.vllm_gpu_memory_utilization,
-                    max_num_seqs=self.args.per_device_train_batch_size * self.args.gradient_accumulation_steps,
+                    # Only `per_device_train_batch_size` sequences are generated at once (per step);
+                    # multiplying by gradient accumulation dramatically over-allocates KV cache.
+                    max_num_seqs=self.args.per_device_train_batch_size,
                     max_model_len=args.max_length,
                     distributed_executor_backend="external_launcher",
                     # Feed identical seed for tp groups to ensure sampling results are the same across workers
@@ -1751,6 +1789,9 @@ class GOLDTrainer(SFTTrainer):
                 model.config._attn_implementation = "paged_attention"
             else:
                 model.config._attn_implementation = "sdpa_paged"
+            stopping_criteria = None
+            if self.stop_sequence_ids:
+                stopping_criteria = StoppingCriteriaList([StopSequenceCriteria(self.stop_sequence_ids)])
             prompt_mask = inputs.get("prompt_attention_mask")
             prompts_tensor = inputs["prompts"]
             if prompt_mask is not None:
@@ -1760,18 +1801,31 @@ class GOLDTrainer(SFTTrainer):
                 ]
             else:
                 prompt_sequences = [row.detach().cpu().tolist() for row in prompts_tensor]
-            generated_outputs = model.generate_batch(prompt_sequences, generation_config=generation_config)
+            generation_kwargs = {"generation_config": generation_config}
+            if stopping_criteria is not None:
+                try:
+                    if "stopping_criteria" in inspect.signature(model.generate_batch).parameters:
+                        generation_kwargs["stopping_criteria"] = stopping_criteria
+                except (TypeError, ValueError):
+                    pass
+            generated_outputs = model.generate_batch(prompt_sequences, **generation_kwargs)
             model.config._attn_implementation = previous_attn
 
             completion_ids = [output.generated_tokens for output in generated_outputs.values()]
             generated_tokens = torch.stack([torch.tensor(ids, device=model.device) for ids in completion_ids])
         else:
-            generated_outputs = model.generate(
-                input_ids=inputs["prompts"],
-                attention_mask=inputs.get("prompt_attention_mask", None),
-                generation_config=generation_config,
-                return_dict_in_generate=True,
-            )
+            stopping_criteria = None
+            if self.stop_sequence_ids:
+                stopping_criteria = StoppingCriteriaList([StopSequenceCriteria(self.stop_sequence_ids)])
+            generation_kwargs = {
+                "input_ids": inputs["prompts"],
+                "attention_mask": inputs.get("prompt_attention_mask", None),
+                "generation_config": generation_config,
+                "return_dict_in_generate": True,
+            }
+            if stopping_criteria is not None:
+                generation_kwargs["stopping_criteria"] = stopping_criteria
+            generated_outputs = model.generate(**generation_kwargs)
             # Get the generated token IDs
             generated_tokens = generated_outputs.sequences
 
@@ -1795,14 +1849,15 @@ class GOLDTrainer(SFTTrainer):
                 )
 
         new_input_ids = generated_tokens
+        input_seq_len = inputs["prompts"].shape[1]
+        completion_start = input_seq_len if new_input_ids.shape[1] >= input_seq_len else 0
         new_attention_mask = torch.ones_like(new_input_ids)
         if pad_token_id is not None:
             new_attention_mask[new_input_ids == pad_token_id] = 0
 
         new_labels = torch.full_like(new_input_ids, -100)
-        for idx in range(batch_size):
-            length = int(prompt_lengths[idx].item())
-            new_labels[idx, length:] = new_input_ids[idx, length:]
+        if completion_start < new_input_ids.shape[1]:
+            new_labels[:, completion_start:] = new_input_ids[:, completion_start:]
 
         if pad_token_id is not None:
             new_labels[new_input_ids == pad_token_id] = -100
@@ -1823,7 +1878,7 @@ class GOLDTrainer(SFTTrainer):
                     clean_up_tokenization_spaces=False,
                 )
             )
-            completion_tokens = new_input_ids[idx, length:]
+            completion_tokens = new_input_ids[idx, completion_start:]
             completion_texts.append(
                 self.processing_class.decode(
                     completion_tokens.tolist(),
@@ -1867,10 +1922,23 @@ class GOLDTrainer(SFTTrainer):
         top_p = self.args.top_p if hasattr(self.args, "top_p") else 1.0
         repetition_penalty = self.args.repetition_penalty if hasattr(self.args, "repetition_penalty") else 1.0
         min_p = self.args.min_p if hasattr(self.args, "min_p") else 0.0
+        stop_sequences = self.stop_sequences
+        stop_token_ids = []
+        if not stop_sequences:
+            stop_token_ids = self.generation_config.eos_token_id
+            if stop_token_ids is None:
+                stop_token_ids = []
+            elif isinstance(stop_token_ids, int):
+                stop_token_ids = [stop_token_ids]
 
         if self.vllm_mode == "server":
             all_prompts_text = gather_object(prompts_text_for_vllm)
             if self.accelerator.is_main_process:
+                generation_kwargs = {}
+                if stop_sequences:
+                    generation_kwargs["stop"] = stop_sequences
+                elif stop_token_ids:
+                    generation_kwargs["stop_token_ids"] = stop_token_ids
                 completion_ids = self.vllm_client.generate(
                     prompts=all_prompts_text,
                     n=1,  # In GKD, we generate 1 completion per prompt from student
@@ -1881,6 +1949,7 @@ class GOLDTrainer(SFTTrainer):
                     min_p=min_p,
                     max_tokens=max_completion_length,
                     guided_decoding_regex=self.vllm_guided_decoding_regex,
+                    generation_kwargs=generation_kwargs,
                 )["completion_ids"]
             else:
                 completion_ids = [None] * len(all_prompts_text)
@@ -1904,6 +1973,8 @@ class GOLDTrainer(SFTTrainer):
                 min_p=min_p,
                 max_tokens=max_completion_length,
                 guided_decoding=guided_decoding,
+                stop=stop_sequences if stop_sequences else None,
+                stop_token_ids=stop_token_ids if stop_token_ids else None,
             )
 
             if hasattr(self, "vllm_tp_group") and self.vllm_tensor_parallel_size > 1:
@@ -2122,6 +2193,8 @@ class GOLDTrainer(SFTTrainer):
                     inputs, self.generation_config, self.processing_class.pad_token_id
                 )
                 new_input_ids, new_attention_mask, new_labels, prompt_texts, completion_texts = result
+                if self.vllm_mode == "colocate" and self.vllm_enable_sleep_mode:
+                    self.vllm_engine.sleep(level=2)
             else:
                 with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
                     result = self.generate_on_policy_outputs(

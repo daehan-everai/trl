@@ -1239,10 +1239,20 @@ def create_model_from_path(
         )
     kwargs["device_map"] = kwargs.get("device_map", "auto")
     if architecture is None:
-        config = AutoConfig.from_pretrained(model_id)
-        architecture = getattr(transformers, config.architectures[0])
-    model = architecture.from_pretrained(model_id, **kwargs)
-    return model
+        config = AutoConfig.from_pretrained(model_id, trust_remote_code=kwargs.get("trust_remote_code", False))
+        architecture_names = getattr(config, "architectures", None) or []
+        if architecture_names:
+            architecture = getattr(transformers, architecture_names[0], None)
+
+        # Some Hub repos (notably tiny random test models) ship configs without an `architectures` field.
+        # Fall back to AutoModel* so we can still load them.
+        if architecture is None:
+            try:
+                return transformers.AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
+            except Exception:
+                return transformers.AutoModel.from_pretrained(model_id, **kwargs)
+
+    return architecture.from_pretrained(model_id, **kwargs)
 
 
 def get_config_model_id(config: PretrainedConfig) -> str:

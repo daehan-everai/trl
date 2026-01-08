@@ -260,7 +260,7 @@ def preflight_teacher(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run GOLD external-teacher smoke training with a dummy teacher.")
+    parser = argparse.ArgumentParser(description="Run GOLD external-teacher training with a dummy teacher.")
     parser.add_argument(
         "--model-id",
         default=None,
@@ -307,7 +307,7 @@ def main() -> None:
     )
     parser.add_argument("--teacher-preflight-requests", type=int, default=3)
     parser.add_argument("--teacher-preflight-min-success", type=int, default=1)
-    parser.add_argument("--output-dir", default="runs/gold-external-teacher-smoke")
+    parser.add_argument("--output-dir", default="runs/gold-external-teacher")
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--num-train-epochs", type=float, default=None)
     parser.add_argument("--per-device-train-batch-size", type=int, default=1)
@@ -336,13 +336,13 @@ def main() -> None:
     parser.add_argument(
         "--log-rollouts-steps",
         type=int,
-        default=100,
+        default=10,
         help="Steps between logging rollouts when --log-rollouts is enabled.",
     )
     parser.add_argument(
         "--rollouts-per-log",
         type=int,
-        default=10,
+        default=3,
         help="Number of rollouts to log when --log-rollouts is enabled.",
     )
     parser.add_argument("--use-vllm", action="store_true", help="Use vLLM for student rollouts.")
@@ -357,7 +357,7 @@ def main() -> None:
         default=None,
         help="Hub repo id for push_to_hub (defaults to EverAI-AI/<model>_onpolicy_french).",
     )
-    parser.add_argument("--wandb-project", default="trl-gold-external-teacher-smoke")
+    parser.add_argument("--wandb-project", default="trl-gold-external-teacher")
     parser.add_argument("--wandb-run-name", default=None)
     args = parser.parse_args()
 

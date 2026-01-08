@@ -93,15 +93,45 @@ def is_uvicorn_available() -> bool:
 
 
 def is_vllm_available() -> bool:
-    if _vllm_available:
-        if not (version.parse("0.10.2") <= version.parse(_vllm_version) <= version.parse("0.11.2")):
-            warnings.warn(
-                "TRL currently supports vLLM versions: 0.10.2, 0.11.0, 0.11.1, 0.11.2. You have version "
-                f"{_vllm_version} installed. We recommend installing a supported version to avoid compatibility "
-                "issues.",
-                stacklevel=2,
-            )
-    return _vllm_available
+    if not _vllm_available:
+        return False
+
+    # vLLM wheels may be present but fail to import depending on the local torch version.
+    # In particular, some vLLM versions assume `torch._inductor.config` is available as an attribute
+    # (it can be importable as a module but not set on `torch._inductor`).
+    try:
+        import torch  # noqa: F401
+
+        import torch._inductor  # noqa: F401
+
+        if not hasattr(torch._inductor, "config"):
+            import torch._inductor.config as inductor_config
+
+            torch._inductor.config = inductor_config
+    except Exception:
+        # If torch is not available (or its internals changed), just try importing vLLM below.
+        pass
+
+    try:
+        vllm_mod = importlib.import_module("vllm")
+        # Ensure the compiled extension is loadable; some environments have wheels that import but
+        # fail when loading `vllm._C` due to ABI/torch mismatches.
+        importlib.import_module("vllm._C")
+    except Exception as exc:
+        warnings.warn(
+            f"vLLM is installed (version={_vllm_version}) but failed to import and will be treated as unavailable: {exc}",
+            stacklevel=2,
+        )
+        return False
+
+    if not (version.parse("0.10.2") <= version.parse(_vllm_version) <= version.parse("0.11.2")):
+        warnings.warn(
+            "TRL currently supports vLLM versions: 0.10.2, 0.11.0, 0.11.1, 0.11.2. You have version "
+            f"{_vllm_version} installed. We recommend installing a supported version to avoid compatibility "
+            "issues.",
+            stacklevel=2,
+        )
+    return True
 
 
 def is_vllm_ascend_available() -> bool:

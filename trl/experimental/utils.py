@@ -137,46 +137,64 @@ class DataCollatorForChatML:
         for example in examples:
             formatted_prompt = example.get(self.prompt_key, None)
             if formatted_prompt is None:
-                prompt = example[self.messages_key][:-1]
+                messages = example[self.messages_key]
+                # Datasets can be either:
+                # - SFT-style: end with an assistant message (prompt is all but the last turn)
+                # - Prompt-only: end with a user message (prompt is the full conversation so far)
+                if messages and messages[-1].get("role") == "user":
+                    prompt = messages
+                else:
+                    prompt = messages[:-1]
                 formatted_prompt = self.tokenizer.apply_chat_template(
                     prompt, tokenize=False, add_generation_prompt=True
                 )
 
+            tokenized_prompt_full = self.tokenizer(
+                formatted_prompt,
+                truncation=False,
+                padding=False,
+                return_tensors=None,
+                add_special_tokens=False,
+            )
+            prompt_ids_for_generation = tokenized_prompt_full["input_ids"]
+            if self.max_length is not None and len(prompt_ids_for_generation) > self.max_length:
+                prompt_ids_for_generation = prompt_ids_for_generation[-self.max_length :]
+
             if "input_ids" not in example:
                 message = example[self.messages_key]
-                formatted_message = self.tokenizer.apply_chat_template(
-                    message, tokenize=False, add_generation_prompt=False
-                )
-
-                tokenized_message = self.tokenizer(
-                    formatted_message,
-                    truncation=False,
-                    padding=False,
-                    return_tensors=None,
-                    add_special_tokens=False,
-                    return_offsets_mapping=True,
-                )
-                message_input_ids_full = tokenized_message["input_ids"]
-                offsets = tokenized_message.get("offset_mapping")
-
-                if offsets is not None:
-                    prompt_char_len = len(formatted_prompt)
-                    completion_start_idx_full = next(
-                        (idx for idx, (start, _) in enumerate(offsets) if start >= prompt_char_len),
-                        len(message_input_ids_full),
-                    )
+                # Prompt-only datasets (ending in user) do not contain an assistant completion. In that case,
+                # we set `input_ids` to the prompt-with-generation-prompt so generation produces an assistant turn.
+                if message and message[-1].get("role") == "user":
+                    message_input_ids_full = prompt_ids_for_generation
+                    prompt_tokens_full = prompt_ids_for_generation
+                    completion_input_ids_full = []
                 else:
-                    tokenized_prompt_full = self.tokenizer(
-                        formatted_prompt,
+                    formatted_message = self.tokenizer.apply_chat_template(
+                        message, tokenize=False, add_generation_prompt=False
+                    )
+
+                    tokenized_message = self.tokenizer(
+                        formatted_message,
                         truncation=False,
                         padding=False,
                         return_tensors=None,
                         add_special_tokens=False,
+                        return_offsets_mapping=True,
                     )
-                    completion_start_idx_full = len(tokenized_prompt_full["input_ids"])
+                    message_input_ids_full = tokenized_message["input_ids"]
+                    offsets = tokenized_message.get("offset_mapping")
 
-                prompt_tokens_full = message_input_ids_full[:completion_start_idx_full]
-                completion_input_ids_full = message_input_ids_full[completion_start_idx_full:]
+                    if offsets is not None:
+                        prompt_char_len = len(formatted_prompt)
+                        completion_start_idx_full = next(
+                            (idx for idx, (start, _) in enumerate(offsets) if start >= prompt_char_len),
+                            len(message_input_ids_full),
+                        )
+                    else:
+                        completion_start_idx_full = len(prompt_ids_for_generation)
+
+                    prompt_tokens_full = message_input_ids_full[:completion_start_idx_full]
+                    completion_input_ids_full = message_input_ids_full[completion_start_idx_full:]
 
                 if self.max_length is not None and len(message_input_ids_full) > self.max_length:
                     completion_ids = completion_input_ids_full
@@ -194,6 +212,7 @@ class DataCollatorForChatML:
                 input_ids.append(message_input_ids)
                 attention_mask.append([1] * len(message_input_ids))
                 current_prompt_ids = prompt_ids
+                prompts_input_ids.append(current_prompt_ids)
             else:
                 message_input_ids = example["input_ids"]
                 input_ids.append(message_input_ids)
@@ -212,7 +231,7 @@ class DataCollatorForChatML:
                 )
                 current_prompt_ids = tokenized_prompt["input_ids"]
 
-            prompts_input_ids.append(current_prompt_ids)
+                prompts_input_ids.append(current_prompt_ids)
             prompt_attention_mask.append([1] * len(current_prompt_ids))
 
             label = [self.ignore_index] * len(input_ids[-1])

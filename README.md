@@ -1,208 +1,100 @@
-# TRL - Transformer Reinforcement Learning
+# GOLD External Teacher Run
 
-<div style="text-align: center">
-    <img src="https://huggingface.co/datasets/trl-lib/documentation-images/resolve/main/trl_banner_dark.png" alt="TRL Banner">
-</div>
+## Purpose
+Run GOLD external-teacher training against a vLLM teacher endpoint and log rollouts to W&B.
 
-<hr> <br>
+## Prereqs
+- `.env` contains:
+  - `HF_TOKEN` (or `HUGGINGFACE_HUB_TOKEN`)
+  - `WANDB_API_KEY`
+  - Optional defaults: `STUDENT_MODEL_ID`, `TEACHER_VLLM_MODEL_NAME`
+- Python deps are installed:
+  - External-teacher run (LoRA + W&B): `pip install -e '.[peft]' wandb`
+  - Local dummy-teacher run (optional): `pip install fastapi uvicorn`
+- Teacher endpoint is reachable and supports `full_logprobs` with `format="top_p"`.
+- Local caches should live under `/workspace` to avoid root disk space issues.
 
-<h3 align="center">
-    <p>A comprehensive library to post-train foundation models</p>
-</h3>
-
-<p align="center">
-    <a href="https://github.com/huggingface/trl/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/github/license/huggingface/trl.svg?color=blue"></a>
-    <a href="https://huggingface.co/docs/trl/index"><img alt="Documentation" src="https://img.shields.io/website?label=documentation&url=https%3A%2F%2Fhuggingface.co%2Fdocs%2Ftrl%2Findex&down_color=red&down_message=offline&up_color=blue&up_message=online"></a>
-    <a href="https://github.com/huggingface/trl/releases"><img alt="GitHub release" src="https://img.shields.io/github/release/huggingface/trl.svg"></a>
-    <a href="https://huggingface.co/trl-lib"><img alt="Hugging Face Hub" src="https://img.shields.io/badge/🤗%20Hub-trl--lib-yellow"></a>
-</p>
-
-## 🎉 What's New
-
-**OpenEnv Integration:** TRL now supports **[OpenEnv](https://huggingface.co/blog/openenv)**, the open-source framework from Meta for defining, deploying, and interacting with environments in reinforcement learning and agentic workflows.
-
-Explore how to seamlessly integrate TRL with OpenEnv in our [dedicated documentation](https://huggingface.co/docs/trl/openenv).
-
-## Overview
-
-TRL is a cutting-edge library designed for post-training foundation models using advanced techniques like Supervised Fine-Tuning (SFT), Group Relative Policy Optimization (GRPO), and Direct Preference Optimization (DPO). Built on top of the [🤗 Transformers](https://github.com/huggingface/transformers) ecosystem, TRL supports a variety of model architectures and modalities, and can be scaled-up across various hardware setups.
-
-## Highlights
-
-- **Trainers**: Various fine-tuning methods are easily accessible via trainers like [`SFTTrainer`](https://huggingface.co/docs/trl/sft_trainer), [`GRPOTrainer`](https://huggingface.co/docs/trl/grpo_trainer), [`DPOTrainer`](https://huggingface.co/docs/trl/dpo_trainer), [`RewardTrainer`](https://huggingface.co/docs/trl/reward_trainer) and more.
-
-- **Efficient and scalable**:
-  - Leverages [🤗 Accelerate](https://github.com/huggingface/accelerate) to scale from single GPU to multi-node clusters using methods like [DDP](https://pytorch.org/tutorials/intermediate/ddp_tutorial.html) and [DeepSpeed](https://github.com/deepspeedai/DeepSpeed).
-  - Full integration with [🤗 PEFT](https://github.com/huggingface/peft) enables training on large models with modest hardware via quantization and LoRA/QLoRA.
-  - Integrates [🦥 Unsloth](https://github.com/unslothai/unsloth) for accelerating training using optimized kernels.
-
-- **Command Line Interface (CLI)**: A simple interface lets you fine-tune with models without needing to write code.
-
-## Installation
-
-### Python Package
-
-Install the library using `pip`:
-
+## Dataset fix and push (if needed)
+If the dataset needs to end on a user turn and drop `prompt`:
 ```bash
-pip install trl
+python scripts/fix_french_conversations_dataset.py --repo-id EverAI-AI/french-conversations-prompt --split train
 ```
 
-### From source
-
-If you want to use the latest features before an official release, you can install TRL from source:
-
+## Environment vars (keep caches on /workspace)
 ```bash
-pip install git+https://github.com/huggingface/trl.git
+export HF_HOME=/workspace/.cache/huggingface
+export HUGGINGFACE_HUB_CACHE=/workspace/.cache/huggingface/hub
+export TRANSFORMERS_CACHE=/workspace/.cache/huggingface/hub
+export HF_DATASETS_CACHE=/workspace/.cache/huggingface/datasets
+export WANDB_DIR=/workspace/wandb
 ```
 
-### Repository
-
-If you want to use the examples you can clone the repository with the following command:
-
+## Run command (current config)
 ```bash
-git clone https://github.com/huggingface/trl.git
+nohup env HF_HOME=/workspace/.cache/huggingface \
+  HUGGINGFACE_HUB_CACHE=/workspace/.cache/huggingface/hub \
+  TRANSFORMERS_CACHE=/workspace/.cache/huggingface/hub \
+  HF_DATASETS_CACHE=/workspace/.cache/huggingface/datasets \
+  WANDB_DIR=/workspace/wandb \
+  python scripts/run_gold_external_teacher.py \
+  --model-id EverAI-AI/MagistSmall-Raven-ALT-2 \
+  --dataset-id EverAI-AI/french-conversations-prompt \
+  --dataset-split train \
+  --teacher-tokenizer microsoft/Phi-3.5-mini-instruct \
+  --teacher-url https://spasmodically-untimeous-marlene.ngrok-free.dev/v1/completions \
+  --teacher-model-name microsoft/Phi-3.5-mini-instruct \
+  --teacher-full-logprobs-format top_p \
+  --teacher-full-logprobs-top-p 0.9999 \
+  --teacher-full-logprobs-max-top-k 512 \
+  --teacher-timeout 10 \
+  --teacher-max-retries 1 \
+  --max-length 2048 \
+  --max-completion-length 256 \
+  --teacher-max-input-tokens 4095 \
+  --use-lora \
+  --lora-r 32 \
+  --learning-rate 1e-5 \
+  --num-train-epochs 1 \
+  --per-device-train-batch-size 15 \
+  --gradient-accumulation-steps 4 \
+  --log-rollouts \
+  --log-rollouts-steps 1 \
+  --rollouts-per-log 3 \
+  > runs/gold-external-teacher/teacher_run.log 2>&1 & echo $!
 ```
 
-## Quick Start
-
-For more flexibility and control over training, TRL provides dedicated trainer classes to post-train language models or PEFT adapters on a custom dataset. Each trainer in TRL is a light wrapper around the 🤗 Transformers trainer and natively supports distributed training methods like DDP, DeepSpeed ZeRO, and FSDP.
-
-### `SFTTrainer`
-
-Here is a basic example of how to use the [`SFTTrainer`](https://huggingface.co/docs/trl/sft_trainer):
-
-```python
-from trl import SFTTrainer
-from datasets import load_dataset
-
-dataset = load_dataset("trl-lib/Capybara", split="train")
-
-trainer = SFTTrainer(
-    model="Qwen/Qwen2.5-0.5B",
-    train_dataset=dataset,
-)
-trainer.train()
-```
-
-### `GRPOTrainer`
-
-[`GRPOTrainer`](https://huggingface.co/docs/trl/grpo_trainer) implements the [Group Relative Policy Optimization (GRPO) algorithm](https://huggingface.co/papers/2402.03300) that is more memory-efficient than PPO and was used to train [Deepseek AI's R1](https://huggingface.co/deepseek-ai/DeepSeek-R1).
-
-```python
-from datasets import load_dataset
-from trl import GRPOTrainer
-from trl.rewards import accuracy_reward
-
-dataset = load_dataset("trl-lib/DeepMath-103K", split="train")
-
-trainer = GRPOTrainer(
-    model="Qwen/Qwen2-0.5B-Instruct",
-    reward_funcs=accuracy_reward,
-    train_dataset=dataset,
-)
-trainer.train()
-```
-
-> [!NOTE]
-> For reasoning models, use the `reasoning_accuracy_reward()` function for better results.
-
-### `DPOTrainer`
-
-[`DPOTrainer`](https://huggingface.co/docs/trl/dpo_trainer) implements the popular [Direct Preference Optimization (DPO) algorithm](https://huggingface.co/papers/2305.18290) that was used to post-train [Llama 3](https://huggingface.co/papers/2407.21783) and many other models. Here is a basic example of how to use the `DPOTrainer`:
-
-```python
-from datasets import load_dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from trl import DPOConfig, DPOTrainer
-
-model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
-tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
-dataset = load_dataset("trl-lib/ultrafeedback_binarized", split="train")
-training_args = DPOConfig(output_dir="Qwen2.5-0.5B-DPO")
-trainer = DPOTrainer(
-    model=model,
-    args=training_args,
-    train_dataset=dataset,
-    processing_class=tokenizer
-)
-trainer.train()
-```
-
-### `RewardTrainer`
-
-Here is a basic example of how to use the [`RewardTrainer`](https://huggingface.co/docs/trl/reward_trainer):
-
-```python
-from trl import RewardTrainer
-from datasets import load_dataset
-
-dataset = load_dataset("trl-lib/ultrafeedback_binarized", split="train")
-
-trainer = RewardTrainer(
-    model="Qwen/Qwen2.5-0.5B-Instruct",
-    train_dataset=dataset,
-)
-trainer.train()
-```
-
-## Command Line Interface (CLI)
-
-You can use the TRL Command Line Interface (CLI) to quickly get started with post-training methods like Supervised Fine-Tuning (SFT) or Direct Preference Optimization (DPO):
-
-**SFT:**
-
+## Quick sanity (1-step, local dummy teacher)
+Use this to validate the training loop without relying on an external vLLM endpoint (dummy teacher only supports `base64_dense`):
 ```bash
-trl sft --model_name_or_path Qwen/Qwen2.5-0.5B \
-    --dataset_name trl-lib/Capybara \
-    --output_dir Qwen2.5-0.5B-SFT
+env HF_HOME=/workspace/.cache/huggingface \
+  HUGGINGFACE_HUB_CACHE=/workspace/.cache/huggingface/hub \
+  HF_DATASETS_CACHE=/workspace/.cache/huggingface/datasets \
+  WANDB_DIR=/workspace/wandb \
+  WANDB_MODE=disabled \
+  python scripts/run_gold_external_teacher.py \
+  --model-id hf-internal-testing/tiny-random-gpt2 \
+  --dataset-id EverAI-AI/french-conversations-prompt \
+  --dataset-split 'train[1:50]' \
+  --teacher-tokenizer hf-internal-testing/tiny-random-gpt2 \
+  --teacher-full-logprobs-format base64_dense \
+  --teacher-preflight-requests 0 \
+  --max-length 512 \
+  --max-completion-length 8 \
+  --max-steps 1 \
+  --per-device-train-batch-size 1 \
+  --gradient-accumulation-steps 1 \
+  --learning-rate 1e-4 \
+  --report-to-none
 ```
 
-**DPO:**
-
+## Monitoring
+- Log file: `runs/gold-external-teacher/teacher_run.log`
+- W&B: use the run URL printed in the log.
+- Check for teacher request errors:
 ```bash
-trl dpo --model_name_or_path Qwen/Qwen2.5-0.5B-Instruct \
-    --dataset_name argilla/Capybara-Preferences \
-    --output_dir Qwen2.5-0.5B-DPO 
+rg -n "Teacher endpoint error|prompt_len|positions_min|positions_max" runs/gold-external-teacher/teacher_run.log
 ```
 
-Read more about CLI in the [relevant documentation section](https://huggingface.co/docs/trl/clis) or use `--help` for more details.
-
-## Development
-
-If you want to contribute to `trl` or customize it to your needs make sure to read the [contribution guide](https://github.com/huggingface/trl/blob/main/CONTRIBUTING.md) and make sure you make a dev install:
-
-```bash
-git clone https://github.com/huggingface/trl.git
-cd trl/
-pip install -e .[dev]
-```
-
-## Experimental
-
-A minimal incubation area is available under `trl.experimental` for unstable / fast-evolving features. Anything there may change or be removed in any release without notice.
-
-Example:
-
-```python
-from trl.experimental.new_trainer import NewTrainer
-```
-
-Read more in the [Experimental docs](https://huggingface.co/docs/trl/experimental_overview).
-
-## Citation
-
-```bibtex
-@misc{vonwerra2022trl,
-  author = {Leandro von Werra and Younes Belkada and Lewis Tunstall and Edward Beeching and Tristan Thrush and Nathan Lambert and Shengyi Huang and Kashif Rasul and Quentin Gallouédec},
-  title = {TRL: Transformer Reinforcement Learning},
-  year = {2020},
-  publisher = {GitHub},
-  journal = {GitHub repository},
-  howpublished = {\url{https://github.com/huggingface/trl}}
-}
-```
-
-## License
-
-This repository's source code is available under the [Apache-2.0 License](LICENSE).
+## Notes
+- Rollouts are logged to W&B via `wandb.Table` when `--log-rollouts` is enabled.
+- Secrets are loaded from `.env`; do not hardcode tokens in scripts.
