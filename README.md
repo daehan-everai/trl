@@ -70,6 +70,21 @@ nohup env HF_HOME=/workspace/.cache/huggingface \
 - Keep `--max-length` and `--teacher-max-input-tokens` within the teacher’s context window.
 - Always verify W&B completions end at the stop marker and do **not** include a new user turn.
 
+## Stop-token prior (optional)
+If the student starts dropping the ChatML stop token (`<|im_end|>`) during on-policy training, you can inject a
+strong teacher prior on the stop token positions. This helps retain the stop marker.
+
+Enable it with:
+```bash
+--force-stop-token \
+--force-stop-token-prob 0.99
+```
+
+Notes:
+- The prior is applied at the end of the completion for the length of the stop sequence, even if the student already emitted it.
+- The probability is applied to the stop token; other tokens are suppressed in the teacher prior.
+- For different chat templates, ensure the stop string matches the student/teacher templates.
+
 ## Quick sanity (1-step, local dummy teacher)
 Use this to validate the training loop without relying on an external vLLM endpoint (dummy teacher only supports `base64_dense`):
 ```bash

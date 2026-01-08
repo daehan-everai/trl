@@ -317,6 +317,22 @@ def main() -> None:
     parser.add_argument("--teacher-port", type=int, default=0)
     parser.add_argument("--learning-rate", type=float, default=1e-6)
     parser.add_argument("--min-new-tokens", type=int, default=None, help="Force a minimum number of generated tokens.")
+    parser.add_argument(
+        "--force-stop-token",
+        action="store_true",
+        help="Inject a strong teacher prior on the stop token when the student misses it.",
+    )
+    parser.add_argument(
+        "--force-stop-token-prob",
+        type=float,
+        default=0.99,
+        help="Target probability for the forced stop token prior (remainder spread uniformly).",
+    )
+    parser.add_argument(
+        "--disable-unmatched-loss",
+        action="store_true",
+        help="Disable the unmatched component of the hybrid ULD loss (matched-only).",
+    )
     parser.add_argument("--use-lora", action="store_true", help="Enable LoRA for the student model.")
     parser.add_argument("--lora-r", type=int, default=16)
     parser.add_argument("--lora-alpha", type=int, default=32)
@@ -520,7 +536,12 @@ def main() -> None:
             vllm_tensor_parallel_size=args.vllm_tensor_parallel_size,
             vllm_sync_frequency=args.vllm_sync_frequency,
             vllm_enable_sleep_mode=args.vllm_enable_sleep_mode,
+            uld_force_stop_token=args.force_stop_token,
+            uld_force_stop_token_prob=args.force_stop_token_prob,
         )
+        if args.disable_unmatched_loss:
+            train_args.uld_hybrid_matched_weight = 1.0
+            train_args.uld_hybrid_unmatched_weight = 0.0
         if args.push_to_hub:
             train_args.hub_private_repo = True
         train_args.model_init_kwargs = model_init_kwargs

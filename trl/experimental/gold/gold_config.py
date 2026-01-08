@@ -326,6 +326,18 @@ class GOLDConfig(SFTConfig):
         default=True,
         metadata={"help": "Whether to skip EOS token for teacher in ULD loss computation."},
     )
+    uld_force_stop_token: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "When true, inject a strong teacher prior on the stop token positions at the end of the completion."
+            )
+        },
+    )
+    uld_force_stop_token_prob: float = field(
+        default=0.99,
+        metadata={"help": "Target probability for the forced stop token prior (remainder spread uniformly)."},
+    )
 
     # transformers paged attention
     use_transformers_paged: bool = field(
@@ -443,6 +455,9 @@ class GOLDConfig(SFTConfig):
 
     def __post_init__(self):
         super().__post_init__()
+
+        if not (0.0 < self.uld_force_stop_token_prob <= 1.0):
+            raise ValueError("uld_force_stop_token_prob must be within (0.0, 1.0].")
 
         if self.use_external_teacher_vllm:
             if self.teacher_tokenizer_name_or_path is None:

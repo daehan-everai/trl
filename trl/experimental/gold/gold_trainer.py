@@ -380,6 +380,7 @@ class ULDLoss(nn.Module):
         vocab_mapping = {}
         teacher_matched_ids = set()
         student_matched_ids = set()
+        student_to_teacher = {}
 
         for token_str, teacher_id in teacher_vocab.items():
             if token_str in student_token_to_id:
@@ -387,10 +388,12 @@ class ULDLoss(nn.Module):
                 vocab_mapping[teacher_id] = student_id
                 teacher_matched_ids.add(teacher_id)
                 student_matched_ids.add(student_id)
+                student_to_teacher.setdefault(student_id, teacher_id)
 
         self._vocab_mapping = vocab_mapping
         self._teacher_matched_ids = teacher_matched_ids
         self._student_matched_ids = student_matched_ids
+        self._student_to_teacher = student_to_teacher
 
     def _compute_distillation_loss(
         self, student_logits, teacher_logits, student_labels, teacher_labels, student_input_ids, teacher_input_ids
@@ -691,7 +694,8 @@ class ULDLoss(nn.Module):
         student_unmatched_probs = student_aligned[:, student_unmatched_mask]  # [seq_len, num_student_unmatched]
 
         unmatched_loss = torch.tensor(0.0, device=device)
-        if teacher_unmatched_probs.size(-1) > 0 and student_unmatched_probs.size(-1) > 0:
+        use_unmatched = not (self.hybrid_unmatched_weight is not None and self.hybrid_unmatched_weight == 0.0)
+        if use_unmatched and teacher_unmatched_probs.size(-1) > 0 and student_unmatched_probs.size(-1) > 0:
             # Sort unmatched probabilities
             teacher_unmatched_sorted = teacher_unmatched_probs.sort(dim=-1, descending=True).values
             student_unmatched_sorted = student_unmatched_probs.sort(dim=-1, descending=True).values
@@ -966,6 +970,18 @@ class GOLDTrainer(SFTTrainer):
 
         if self.stop_sequence_ids_trim:
             self.generation_config.eos_token_id = None
+
+        self.uld_force_stop_token = getattr(args, "uld_force_stop_token", False)
+        self.uld_force_stop_token_prob = getattr(args, "uld_force_stop_token_prob", 0.99)
+        self.stop_sequence_ids_teacher = []
+        if self.teacher_tokenizer is not None and self.stop_sequences_trim:
+            for seq in self.stop_sequences_trim:
+                try:
+                    seq_ids = self.teacher_tokenizer.encode(seq, add_special_tokens=False)
+                except Exception:
+                    seq_ids = []
+                if seq_ids:
+                    self.stop_sequence_ids_teacher.append(seq_ids)
 
         # Initialize the metrics
         self._metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
@@ -1590,6 +1606,34 @@ class GOLDTrainer(SFTTrainer):
                         min_length = min(len(student_token_ids), len(teacher_token_ids))
                         student_aligned = student_probs[:min_length, :]
                         teacher_aligned = teacher_probs[:min_length, :]
+
+                    if self.uld_force_stop_token:
+                        stop_token_ids = []
+                        if (
+                            self.uld_loss_fn is not None
+                            and getattr(self.uld_loss_fn, "_student_to_teacher", None) is not None
+                            and self.stop_sequence_ids_trim
+                        ):
+                            for student_id in self.stop_sequence_ids_trim[0]:
+                                teacher_id = self.uld_loss_fn._student_to_teacher.get(student_id)
+                                if teacher_id is None:
+                                    stop_token_ids = []
+                                    break
+                                stop_token_ids.append(teacher_id)
+                        if not stop_token_ids and self.stop_sequence_ids_teacher:
+                            stop_token_ids = self.stop_sequence_ids_teacher[0]
+                        if stop_token_ids:
+                            if self.stop_sequence_ids_trim:
+                                target_len = len(self.stop_sequence_ids_trim[0])
+                            else:
+                                target_len = len(stop_token_ids)
+                            start_idx = max(0, teacher_aligned.size(0) - target_len)
+                            teacher_aligned = self._apply_stop_token_prior(
+                                teacher_aligned,
+                                stop_token_ids,
+                                start_idx=start_idx,
+                                target_len=target_len,
+                            )
 
                     if self.uld_loss_fn.use_hybrid_loss and self.uld_loss_fn._vocab_mapping is not None:
                         aligned_loss = self.uld_loss_fn._compute_hybrid_uld_loss(student_aligned, teacher_aligned)
@@ -2298,6 +2342,35 @@ class GOLDTrainer(SFTTrainer):
         if self.vllm_mode == "colocate" and self.vllm_enable_sleep_mode:
             empty_cache()
             self.vllm_engine.wake_up(tags=["kv_cache"])
+
+    def _apply_stop_token_prior(
+        self,
+        teacher_probs: torch.Tensor,
+        stop_token_ids: list[int],
+        *,
+        start_idx: int,
+        target_len: int,
+    ) -> torch.Tensor:
+        if teacher_probs.numel() == 0 or not stop_token_ids or target_len <= 0:
+            return teacher_probs
+        seq_len, vocab_size = teacher_probs.size(0), teacher_probs.size(-1)
+        if vocab_size <= 0:
+            return teacher_probs
+
+        force_prob = float(self.uld_force_stop_token_prob)
+        for offset in range(target_len):
+            if offset >= len(stop_token_ids):
+                break
+            stop_id = stop_token_ids[offset]
+            if stop_id < 0 or stop_id >= vocab_size:
+                continue
+            row_idx = start_idx + offset
+            if row_idx < 0 or row_idx >= seq_len:
+                continue
+            forced = torch.zeros((vocab_size,), device=teacher_probs.device, dtype=teacher_probs.dtype)
+            forced[stop_id] = force_prob
+            teacher_probs[row_idx] = forced
+        return teacher_probs
 
     @profiling_decorator
     def training_step(
