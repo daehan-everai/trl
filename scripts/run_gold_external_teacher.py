@@ -296,7 +296,7 @@ def main() -> None:
     parser.add_argument(
         "--teacher-full-logprobs-max-top-k",
         type=int,
-        default=512,
+        default=768,
         help="Maximum top-k per position for sparse full_logprobs format.",
     )
     parser.add_argument(
@@ -521,6 +521,8 @@ def main() -> None:
             vllm_sync_frequency=args.vllm_sync_frequency,
             vllm_enable_sleep_mode=args.vllm_enable_sleep_mode,
         )
+        if args.push_to_hub:
+            train_args.hub_private_repo = True
         train_args.model_init_kwargs = model_init_kwargs
         train_args.log_completions = args.log_rollouts
         train_args.log_completions_steps = args.log_rollouts_steps
