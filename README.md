@@ -63,6 +63,13 @@ nohup env HF_HOME=/workspace/.cache/huggingface \
   > runs/gold-external-teacher/teacher_run.log 2>&1 & echo $!
 ```
 
+## Best practices
+- Start with a short sanity run (`--max-steps 1` or small split) before a full epoch.
+- Keep rollouts logging at `--log-rollouts-steps 1` until outputs look sane, then increase.
+- Make sure the dataset ends on a user turn so the model actually generates an assistant reply.
+- Keep `--max-length` and `--teacher-max-input-tokens` within the teacher’s context window.
+- Always verify W&B completions end at the stop marker and do **not** include a new user turn.
+
 ## Quick sanity (1-step, local dummy teacher)
 Use this to validate the training loop without relying on an external vLLM endpoint (dummy teacher only supports `base64_dense`):
 ```bash
@@ -94,6 +101,18 @@ env HF_HOME=/workspace/.cache/huggingface \
 ```bash
 rg -n "Teacher endpoint error|prompt_len|positions_min|positions_max" runs/gold-external-teacher/teacher_run.log
 ```
+
+## Changing models
+### Student model
+- Rollout stopping is keyed off the chat template stop marker. For ChatML models it is `<|im_end|>`.
+- If a new student uses a different template (e.g., `<|eot_id|>` or `</s>`), update the template or adjust
+  the stop marker in `trl/experimental/gold/gold_trainer.py` to match that string.
+- No hardcoded token IDs are required; the stop string is detected from the template.
+
+### Teacher model
+- Update: `--teacher-tokenizer`, `--teacher-model-name`, and `--teacher-url`.
+- Set `--teacher-max-input-tokens` to the teacher’s real context limit (or slightly under it).
+- Ensure the teacher endpoint supports `full_logprobs` with `format="top_p"`.
 
 ## Notes
 - Rollouts are logged to W&B via `wandb.Table` when `--log-rollouts` is enabled.
