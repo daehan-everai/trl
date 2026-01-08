@@ -962,6 +962,7 @@ class GOLDTrainer(SFTTrainer):
                 seq_ids = []
             if seq_ids:
                 self.stop_sequence_ids_trim.append(seq_ids)
+        self.stop_sequence_ids_generate = list(self.stop_sequence_ids_trim)
 
         if self.stop_sequence_ids_trim:
             self.generation_config.eos_token_id = None
@@ -1239,6 +1240,7 @@ class GOLDTrainer(SFTTrainer):
                                 add_generation_prompt=True,  # Add assistant prompt
                                 **example.get("chat_template_kwargs", {}),
                             )
+                            prompt_text = DataCollatorForChatML._append_chatml_generation_prompt(prompt_text)
 
                             # Get the full conversation with assistant response
                             full_text = processing_class.apply_chat_template(
@@ -1872,7 +1874,15 @@ class GOLDTrainer(SFTTrainer):
             else:
                 prompt_sequences = [row.detach().cpu().tolist() for row in prompts_tensor]
             stopping_criteria = None
-            if self.stop_strings_generate:
+            if self.stop_sequence_ids_generate:
+                if prompt_mask is not None:
+                    start_lengths = [int(mask.sum().item()) for mask in prompt_mask]
+                else:
+                    start_lengths = [int(len(row)) for row in prompt_sequences]
+                stopping_criteria = StoppingCriteriaList(
+                    [StopSequenceCriteria(self.stop_sequence_ids_generate, start_lengths)]
+                )
+            elif self.stop_strings_generate:
                 if prompt_mask is not None:
                     start_lengths = [int(mask.sum().item()) for mask in prompt_mask]
                 else:
@@ -1894,7 +1904,12 @@ class GOLDTrainer(SFTTrainer):
             generated_tokens = torch.stack([torch.tensor(ids, device=model.device) for ids in completion_ids])
         else:
             stopping_criteria = None
-            if self.stop_strings_generate:
+            if self.stop_sequence_ids_generate:
+                start_length = int(inputs["prompts"].shape[1])
+                stopping_criteria = StoppingCriteriaList(
+                    [StopSequenceCriteria(self.stop_sequence_ids_generate, start_length)]
+                )
+            elif self.stop_strings_generate:
                 start_length = int(inputs["prompts"].shape[1])
                 stopping_criteria = StoppingCriteriaList(
                     [StopAfterPromptCriteria(self.processing_class, self.stop_strings_generate, start_length)]

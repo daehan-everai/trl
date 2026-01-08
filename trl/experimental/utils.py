@@ -133,6 +133,9 @@ class DataCollatorForChatML:
         prompts_input_ids = []
         prompt_attention_mask = []
         labels = []
+        include_original_text = any("original_prompt_text" in example for example in examples)
+        original_prompt_texts = []
+        original_completion_texts = []
 
         for example in examples:
             formatted_prompt = example.get(self.prompt_key, None)
@@ -148,6 +151,9 @@ class DataCollatorForChatML:
                 formatted_prompt = self.tokenizer.apply_chat_template(
                     prompt, tokenize=False, add_generation_prompt=True
                 )
+                formatted_prompt = self._append_chatml_generation_prompt(formatted_prompt)
+            else:
+                formatted_prompt = self._append_chatml_generation_prompt(formatted_prompt)
 
             tokenized_prompt_full = self.tokenizer(
                 formatted_prompt,
@@ -232,12 +238,18 @@ class DataCollatorForChatML:
                 current_prompt_ids = tokenized_prompt["input_ids"]
 
                 prompts_input_ids.append(current_prompt_ids)
+            if formatted_prompt is not None:
+                current_prompt_ids = self._maybe_append_chatml_generation_ids(formatted_prompt, current_prompt_ids)
+                prompts_input_ids[-1] = current_prompt_ids
             prompt_attention_mask.append([1] * len(current_prompt_ids))
 
             label = [self.ignore_index] * len(input_ids[-1])
             completion_start_idx = len(current_prompt_ids)
             label[completion_start_idx:] = input_ids[-1][completion_start_idx:]
             labels.append(label)
+            if include_original_text:
+                original_prompt_texts.append(example.get("original_prompt_text", ""))
+                original_completion_texts.append(example.get("original_completion_text", ""))
 
         # convert to list of tensors and pad
         input_ids = [torch.tensor(ids, dtype=torch.long) for ids in input_ids]
@@ -258,7 +270,35 @@ class DataCollatorForChatML:
             "labels": labels,
             "prompts": prompts_input_ids,
             "prompt_attention_mask": prompt_attention_mask,
+            **(
+                {
+                    "original_prompt_text": original_prompt_texts,
+                    "original_completion_text": original_completion_texts,
+                }
+                if include_original_text
+                else {}
+            ),
         }
+
+    @staticmethod
+    def _append_chatml_generation_prompt(formatted_prompt: str) -> str:
+        stripped = formatted_prompt.rstrip()
+        if "<|im_start|>" in formatted_prompt and "<|im_end|>" in formatted_prompt:
+            if not stripped.endswith("<|im_start|>assistant"):
+                return formatted_prompt + "<|im_start|>assistant\n"
+        return formatted_prompt
+
+    def _maybe_append_chatml_generation_ids(self, formatted_prompt: str, prompt_ids: list[int]) -> list[int]:
+        if "<|im_start|>" not in formatted_prompt or "<|im_end|>" not in formatted_prompt:
+            return prompt_ids
+        suffix_ids = self.tokenizer("<|im_start|>assistant\n", add_special_tokens=False)["input_ids"]
+        if not suffix_ids:
+            return prompt_ids
+        if len(prompt_ids) >= len(suffix_ids) and prompt_ids[-len(suffix_ids) :] == suffix_ids:
+            return prompt_ids
+        if formatted_prompt.rstrip().endswith("<|im_start|>assistant"):
+            return prompt_ids
+        return prompt_ids + suffix_ids
 
 
 def truncate_right(
