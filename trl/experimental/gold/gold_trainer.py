@@ -1482,6 +1482,9 @@ class GOLDTrainer(SFTTrainer):
                     if max_positions is not None:
                         max_positions = min(max_positions, int(student_size))
                         teacher_positions = teacher_positions[:max_positions]
+                    if not teacher_positions:
+                        distillation_losses.append(outputs_student.logits[i].sum() * 0.0)
+                        continue
                     if max_teacher_tokens is not None and teacher_seq_len > max_teacher_tokens:
                         trim_offset = teacher_seq_len - max_teacher_tokens
                         teacher_token_ids_full = teacher_token_ids_full[trim_offset:]
