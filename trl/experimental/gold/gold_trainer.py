@@ -900,6 +900,10 @@ class GOLDTrainer(SFTTrainer):
         chat_template = getattr(self.processing_class, "chat_template", None)
         if chat_template and "<|im_end|>" in chat_template:
             self.stop_sequences.append("<|im_end|>")
+            self.stop_sequences.append("<|")
+
+        if self.stop_sequences:
+            self.stop_sequences = list(dict.fromkeys(self.stop_sequences))
 
         self.stop_sequence_ids = []
         for seq in self.stop_sequences:
