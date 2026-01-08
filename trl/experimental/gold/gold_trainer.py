@@ -917,9 +917,12 @@ class GOLDTrainer(SFTTrainer):
             self.generation_config.eos_token_id = self.model.generation_config.eos_token_id
 
         self.stop_sequences = []
+        self.stop_sequences_vllm = []
         chat_template = getattr(self.processing_class, "chat_template", None)
         if chat_template and "<|im_end|>" in chat_template:
             self.stop_sequences.append("<|im_end|>")
+            self.stop_sequences.append("<|")
+            self.stop_sequences_vllm.append("<|im_end|>")
 
         self.stop_sequence_ids = []
         for seq in self.stop_sequences:
@@ -933,7 +936,7 @@ class GOLDTrainer(SFTTrainer):
         if self.stop_sequence_ids:
             self.generation_config.eos_token_id = None
 
-        self.stop_sequence_ids_primary = self.stop_sequence_ids[0] if self.stop_sequence_ids else []
+        self.stop_sequence_ids_trim = self.stop_sequence_ids
 
         # Initialize the metrics
         self._metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
@@ -1863,20 +1866,21 @@ class GOLDTrainer(SFTTrainer):
             # Get the generated token IDs
             generated_tokens = generated_outputs.sequences
 
-        stop_seq = self.stop_sequence_ids_primary
-        if stop_seq:
-            stop_len = len(stop_seq)
-            stop_seq = torch.tensor(stop_seq, device=generated_tokens.device)
+        stop_seqs = self.stop_sequence_ids_trim
+        if stop_seqs:
             input_seq_len = inputs["prompts"].shape[1]
             for idx in range(generated_tokens.size(0)):
                 seq = generated_tokens[idx]
-                if seq.numel() < input_seq_len + stop_len:
-                    continue
                 found = None
-                for pos in range(input_seq_len, seq.numel() - stop_len + 1):
-                    if torch.equal(seq[pos : pos + stop_len], stop_seq):
-                        found = pos + stop_len
-                        break
+                for stop_seq in stop_seqs:
+                    stop_len = len(stop_seq)
+                    if seq.numel() < input_seq_len + stop_len:
+                        continue
+                    stop_tensor = torch.tensor(stop_seq, device=seq.device)
+                    for pos in range(input_seq_len, seq.numel() - stop_len + 1):
+                        if torch.equal(seq[pos : pos + stop_len], stop_tensor):
+                            found = pos if found is None else min(found, pos)
+                            break
                 if found is not None and pad_token_id is not None and found < seq.numel():
                     seq[found:] = pad_token_id
 
@@ -1975,7 +1979,7 @@ class GOLDTrainer(SFTTrainer):
         top_p = self.args.top_p if hasattr(self.args, "top_p") else 1.0
         repetition_penalty = self.args.repetition_penalty if hasattr(self.args, "repetition_penalty") else 1.0
         min_p = self.args.min_p if hasattr(self.args, "min_p") else 0.0
-        stop_sequences = self.stop_sequences
+        stop_sequences = self.stop_sequences_vllm
         stop_token_ids = []
         if not stop_sequences:
             stop_token_ids = self.generation_config.eos_token_id
@@ -2055,16 +2059,17 @@ class GOLDTrainer(SFTTrainer):
         else:
             raise ValueError(f"Unknown vllm_mode: {self.vllm_mode}")
 
-        stop_seq_ids = self.stop_sequence_ids_primary
+        stop_seq_ids = self.stop_sequence_ids_trim
         if stop_seq_ids:
-            stop_len = len(stop_seq_ids)
             trimmed = []
             for ids in completion_ids:
                 cut = None
-                for pos in range(0, max(0, len(ids) - stop_len + 1)):
-                    if ids[pos : pos + stop_len] == stop_seq_ids:
-                        cut = pos + stop_len
-                        break
+                for stop_seq in stop_seq_ids:
+                    stop_len = len(stop_seq)
+                    for pos in range(0, max(0, len(ids) - stop_len + 1)):
+                        if ids[pos : pos + stop_len] == stop_seq:
+                            cut = pos if cut is None else min(cut, pos)
+                            break
                 trimmed.append(ids[:cut] if cut is not None else ids)
             completion_ids = trimmed
 
