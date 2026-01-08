@@ -1480,6 +1480,16 @@ class GOLDTrainer(SFTTrainer):
             max_teacher_tokens = getattr(self.args, "teacher_vllm_max_input_tokens", None)
             if max_teacher_tokens is not None:
                 max_teacher_tokens = int(max_teacher_tokens)
+                prefix_token_count = 0
+                if self.teacher_prompt_prefix and self.teacher_tokenizer is not None:
+                    sep = self.teacher_prompt_prefix_sep or ""
+                    prefix_text = f"{self.teacher_prompt_prefix}{sep}"
+                    try:
+                        prefix_token_count = len(
+                            self.teacher_tokenizer(prefix_text, add_special_tokens=False)["input_ids"]
+                        )
+                    except Exception:
+                        prefix_token_count = 0
                 prompt_texts = list(prompt_texts)
                 for i in range(len(prompt_texts)):
                     student_start = student_answer_index[i]
@@ -1487,7 +1497,7 @@ class GOLDTrainer(SFTTrainer):
                     if student_start <= 0 or student_size <= 0:
                         continue
                     # Keep margin proportional to completion length using student token counts.
-                    max_prompt_tokens = max_teacher_tokens - int(math.ceil(1.5 * student_size))
+                    max_prompt_tokens = max_teacher_tokens - int(math.ceil(1.5 * student_size)) - prefix_token_count
                     if max_prompt_tokens < 0:
                         max_prompt_tokens = 0
                     if student_start > max_prompt_tokens:

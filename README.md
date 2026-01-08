@@ -95,6 +95,7 @@ the student prompt formatting:
 Notes:
 - The prompt is prepended to the teacher prompt with a configurable separator (`--teacher-system-prompt-sep`, default: blank line).
 - This only affects the teacher logprobs; the student still sees the original prompt.
+- When `--teacher-max-input-tokens` is set, the system prompt consumes part of the teacher token budget.
 
 ## Quick sanity (1-step, local dummy teacher)
 Use this to validate the training loop without relying on an external vLLM endpoint (dummy teacher only supports `base64_dense`):
