@@ -952,7 +952,7 @@ class GOLDTrainer(SFTTrainer):
         if chat_template and "<|im_end|>" in chat_template:
             self.stop_sequences_trim.append("<|im_end|>")
             self.stop_sequences_vllm.append("<|im_end|>")
-            self.stop_strings_generate.append("<|")
+            self.stop_strings_generate.append("<|im_end|>")
 
         self.stop_sequence_ids_trim = []
         for seq in self.stop_sequences_trim:
@@ -962,7 +962,7 @@ class GOLDTrainer(SFTTrainer):
                 seq_ids = []
             if seq_ids:
                 self.stop_sequence_ids_trim.append(seq_ids)
-        self.stop_sequence_ids_generate = list(self.stop_sequence_ids_trim)
+        self.stop_sequence_ids_generate = []
 
         if self.stop_sequence_ids_trim:
             self.generation_config.eos_token_id = None
@@ -1858,13 +1858,14 @@ class GOLDTrainer(SFTTrainer):
 
     def generate_on_policy_outputs(self, model, inputs, generation_config, pad_token_id=None):
         # Generate output with respect to the prompt only
+        prompt_mask = inputs.get("prompt_attention_mask")
+        pad_token_id = pad_token_id if pad_token_id is not None else self.processing_class.pad_token_id
         if self.use_transformers_paged:
             previous_attn = self.model.config._attn_implementation
             if is_flash_attn_2_available():
                 model.config._attn_implementation = "paged_attention"
             else:
                 model.config._attn_implementation = "sdpa_paged"
-            prompt_mask = inputs.get("prompt_attention_mask")
             prompts_tensor = inputs["prompts"]
             if prompt_mask is not None:
                 prompt_sequences = [
@@ -1926,6 +1927,22 @@ class GOLDTrainer(SFTTrainer):
             # Get the generated token IDs
             generated_tokens = generated_outputs.sequences
 
+        batch_size = generated_tokens.size(0)
+        device = generated_tokens.device
+
+        if prompt_mask is not None:
+            prompt_lengths = prompt_mask.sum(dim=1).to(torch.long)
+        else:
+            if pad_token_id is not None:
+                prompt_lengths = (inputs["prompts"] != pad_token_id).sum(dim=1).to(torch.long)
+            else:
+                prompt_lengths = torch.full(
+                    (batch_size,),
+                    inputs["prompts"].shape[1],
+                    dtype=torch.long,
+                    device=device,
+                )
+
         stop_seqs = self.stop_sequence_ids_trim
         if stop_seqs:
             input_seq_len = inputs["prompts"].shape[1]
@@ -1943,25 +1960,6 @@ class GOLDTrainer(SFTTrainer):
                             break
                 if found is not None and pad_token_id is not None and found < seq.numel():
                     seq[found:] = pad_token_id
-
-        batch_size = generated_tokens.size(0)
-        device = generated_tokens.device
-
-        prompt_mask = inputs.get("prompt_attention_mask")
-        pad_token_id = pad_token_id if pad_token_id is not None else self.processing_class.pad_token_id
-
-        if prompt_mask is not None:
-            prompt_lengths = prompt_mask.sum(dim=1).to(torch.long)
-        else:
-            if pad_token_id is not None:
-                prompt_lengths = (inputs["prompts"] != pad_token_id).sum(dim=1).to(torch.long)
-            else:
-                prompt_lengths = torch.full(
-                    (batch_size,),
-                    inputs["prompts"].shape[1],
-                    dtype=torch.long,
-                    device=device,
-                )
 
         new_input_ids = generated_tokens
         input_seq_len = inputs["prompts"].shape[1]
