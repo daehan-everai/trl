@@ -920,10 +920,6 @@ class GOLDTrainer(SFTTrainer):
         chat_template = getattr(self.processing_class, "chat_template", None)
         if chat_template and "<|im_end|>" in chat_template:
             self.stop_sequences.append("<|im_end|>")
-            self.stop_sequences.append("<|")
-
-        if self.stop_sequences:
-            self.stop_sequences = list(dict.fromkeys(self.stop_sequences))
 
         self.stop_sequence_ids = []
         for seq in self.stop_sequences:
@@ -936,6 +932,8 @@ class GOLDTrainer(SFTTrainer):
 
         if self.stop_sequence_ids:
             self.generation_config.eos_token_id = None
+
+        self.stop_sequence_ids_primary = self.stop_sequence_ids[0] if self.stop_sequence_ids else []
 
         # Initialize the metrics
         self._metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
@@ -1865,6 +1863,23 @@ class GOLDTrainer(SFTTrainer):
             # Get the generated token IDs
             generated_tokens = generated_outputs.sequences
 
+        stop_seq = self.stop_sequence_ids_primary
+        if stop_seq:
+            stop_len = len(stop_seq)
+            stop_seq = torch.tensor(stop_seq, device=generated_tokens.device)
+            input_seq_len = inputs["prompts"].shape[1]
+            for idx in range(generated_tokens.size(0)):
+                seq = generated_tokens[idx]
+                if seq.numel() < input_seq_len + stop_len:
+                    continue
+                found = None
+                for pos in range(input_seq_len, seq.numel() - stop_len + 1):
+                    if torch.equal(seq[pos : pos + stop_len], stop_seq):
+                        found = pos + stop_len
+                        break
+                if found is not None and pad_token_id is not None and found < seq.numel():
+                    seq[found:] = pad_token_id
+
         batch_size = generated_tokens.size(0)
         device = generated_tokens.device
 
@@ -1915,6 +1930,8 @@ class GOLDTrainer(SFTTrainer):
                 )
             )
             completion_tokens = new_input_ids[idx, completion_start:]
+            if pad_token_id is not None:
+                completion_tokens = completion_tokens[completion_tokens != pad_token_id]
             completion_texts.append(
                 self.processing_class.decode(
                     completion_tokens.tolist(),
@@ -2037,6 +2054,19 @@ class GOLDTrainer(SFTTrainer):
                 self.vllm_engine.sleep(level=2)
         else:
             raise ValueError(f"Unknown vllm_mode: {self.vllm_mode}")
+
+        stop_seq_ids = self.stop_sequence_ids_primary
+        if stop_seq_ids:
+            stop_len = len(stop_seq_ids)
+            trimmed = []
+            for ids in completion_ids:
+                cut = None
+                for pos in range(0, max(0, len(ids) - stop_len + 1)):
+                    if ids[pos : pos + stop_len] == stop_seq_ids:
+                        cut = pos + stop_len
+                        break
+                trimmed.append(ids[:cut] if cut is not None else ids)
+            completion_ids = trimmed
 
         # We need to combine prompt and completion for new_input_ids
         # Tokenize prompts again to get prompt_ids on the correct device and format
