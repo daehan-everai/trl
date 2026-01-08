@@ -1491,6 +1491,23 @@ class GOLDTrainer(SFTTrainer):
                         distillation_losses.append(outputs_student.logits[i].sum() * 0.0)
                         continue
 
+                    if self.stop_sequence_ids_trim:
+                        completion_tokens = inputs["input_ids"][i, student_start : student_start + student_size].tolist()
+                        cut = None
+                        for stop_seq in self.stop_sequence_ids_trim:
+                            stop_len = len(stop_seq)
+                            if stop_len == 0 or len(completion_tokens) < stop_len:
+                                continue
+                            for pos in range(0, len(completion_tokens) - stop_len + 1):
+                                if completion_tokens[pos : pos + stop_len] == stop_seq:
+                                    cut = pos if cut is None else min(cut, pos)
+                                    break
+                        if cut is not None:
+                            student_size = min(student_size, cut)
+                            if student_size <= 0:
+                                distillation_losses.append(outputs_student.logits[i].sum() * 0.0)
+                                continue
+
                     teacher_token_ids_full = teacher_input_ids[i, : int(teacher_attention_mask[i].sum().item())].tolist()
                     teacher_seq_len = len(teacher_token_ids_full)
                     teacher_positions = list(range(teacher_start - 1, teacher_start - 1 + teacher_size))
