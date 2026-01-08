@@ -172,19 +172,39 @@ def print_prompt_completions_sample_uld(
 
 
 class StopSequenceCriteria(StoppingCriteria):
-    def __init__(self, stop_sequences: list[list[int]]):
+    def __init__(self, stop_sequences: list[list[int]], start_lengths: list[int] | int):
         super().__init__()
         self.stop_sequences = [torch.tensor(seq, dtype=torch.long) for seq in stop_sequences if seq]
+        if isinstance(start_lengths, int):
+            self.start_lengths = None
+            self.start_length = start_lengths
+        else:
+            self.start_lengths = torch.tensor(start_lengths, dtype=torch.long)
+            self.start_length = None
 
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> torch.BoolTensor:
         if not self.stop_sequences:
             return torch.zeros((input_ids.shape[0],), dtype=torch.bool, device=input_ids.device)
+        if self.start_lengths is None:
+            start_lengths = torch.full(
+                (input_ids.shape[0],),
+                int(self.start_length),
+                dtype=torch.long,
+                device=input_ids.device,
+            )
+        else:
+            start_lengths = self.start_lengths.to(input_ids.device)
+            if start_lengths.numel() != input_ids.shape[0]:
+                start_lengths = start_lengths[: input_ids.shape[0]]
         is_done = torch.zeros((input_ids.shape[0],), dtype=torch.bool, device=input_ids.device)
         for seq in self.stop_sequences:
             if input_ids.shape[1] < seq.numel():
                 continue
             seq = seq.to(input_ids.device)
-            is_done = is_done | (input_ids[:, -seq.numel() :] == seq).all(dim=1)
+            match = (input_ids[:, -seq.numel() :] == seq).all(dim=1)
+            match_start = input_ids.shape[1] - seq.numel()
+            match = match & (match_start >= start_lengths)
+            is_done = is_done | match
         return is_done
 
 
@@ -1796,9 +1816,6 @@ class GOLDTrainer(SFTTrainer):
                 model.config._attn_implementation = "paged_attention"
             else:
                 model.config._attn_implementation = "sdpa_paged"
-            stopping_criteria = None
-            if self.stop_sequence_ids:
-                stopping_criteria = StoppingCriteriaList([StopSequenceCriteria(self.stop_sequence_ids)])
             prompt_mask = inputs.get("prompt_attention_mask")
             prompts_tensor = inputs["prompts"]
             if prompt_mask is not None:
@@ -1808,6 +1825,15 @@ class GOLDTrainer(SFTTrainer):
                 ]
             else:
                 prompt_sequences = [row.detach().cpu().tolist() for row in prompts_tensor]
+            stopping_criteria = None
+            if self.stop_sequence_ids:
+                if prompt_mask is not None:
+                    start_lengths = [int(mask.sum().item()) for mask in prompt_mask]
+                else:
+                    start_lengths = [int(len(row)) for row in prompt_sequences]
+                stopping_criteria = StoppingCriteriaList(
+                    [StopSequenceCriteria(self.stop_sequence_ids, start_lengths)]
+                )
             generation_kwargs = {"generation_config": generation_config}
             if stopping_criteria is not None:
                 try:
@@ -1823,7 +1849,10 @@ class GOLDTrainer(SFTTrainer):
         else:
             stopping_criteria = None
             if self.stop_sequence_ids:
-                stopping_criteria = StoppingCriteriaList([StopSequenceCriteria(self.stop_sequence_ids)])
+                start_length = int(inputs["prompts"].shape[1])
+                stopping_criteria = StoppingCriteriaList(
+                    [StopSequenceCriteria(self.stop_sequence_ids, start_length)]
+                )
             generation_kwargs = {
                 "input_ids": inputs["prompts"],
                 "attention_mask": inputs.get("prompt_attention_mask", None),
