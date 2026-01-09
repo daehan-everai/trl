@@ -11,7 +11,7 @@ Run GOLD external-teacher training against a vLLM teacher endpoint and log rollo
 - Python deps are installed:
   - External-teacher run (LoRA + W&B): `pip install -e '.[peft]' wandb`
   - Local dummy-teacher run (optional): `pip install fastapi uvicorn`
-- Teacher endpoint is reachable and supports `full_logprobs` with `format="top_p"`.
+- Teacher endpoint is reachable and supports `full_logprobs` with `format="top_p"` (avoid `base64_dense` to reduce ngrok payload cost).
 - Local caches should live under `/workspace` to avoid root disk space issues.
 
 ## Dataset fix and push (if needed)
@@ -45,7 +45,7 @@ nohup env HF_HOME=/workspace/.cache/huggingface \
   --teacher-model-name microsoft/Phi-3.5-mini-instruct \
   --teacher-full-logprobs-format top_p \
   --teacher-full-logprobs-top-p 0.9999 \
-  --teacher-full-logprobs-max-top-k 512 \
+  --teacher-full-logprobs-max-top-k 1024 \
   --teacher-timeout 10 \
   --teacher-max-retries 1 \
   --max-length 2048 \
@@ -69,33 +69,6 @@ nohup env HF_HOME=/workspace/.cache/huggingface \
 - Make sure the dataset ends on a user turn so the model actually generates an assistant reply.
 - Keep `--max-length` and `--teacher-max-input-tokens` within the teacher’s context window.
 - Always verify W&B completions end at the stop marker and do **not** include a new user turn.
-
-## Stop-token prior (optional)
-If the student starts dropping the ChatML stop token (`<|im_end|>`) during on-policy training, you can inject a
-strong teacher prior on the stop token positions. This helps retain the stop marker.
-
-Enable it with:
-```bash
---force-stop-token \
---force-stop-token-prob 0.99
-```
-
-Notes:
-- The prior is applied at the end of the completion for the length of the stop sequence, even if the student already emitted it.
-- The probability is applied to the stop token; other tokens are suppressed in the teacher prior.
-- For different chat templates, ensure the stop string matches the student/teacher templates.
-
-## Teacher system prompt (optional)
-You can inject a system instruction into the teacher prompt to steer the teacher distributions without altering
-the student prompt formatting:
-```bash
---teacher-system-prompt "respond in french, as bitchy as possible. at least 2 sentence with actions embraced with asterisks(*)"
-```
-
-Notes:
-- The prompt is prepended to the teacher prompt with a configurable separator (`--teacher-system-prompt-sep`, default: blank line).
-- This only affects the teacher logprobs; the student still sees the original prompt.
-- When `--teacher-max-input-tokens` is set, the system prompt consumes part of the teacher token budget.
 
 ## Quick sanity (1-step, local dummy teacher)
 Use this to validate the training loop without relying on an external vLLM endpoint (dummy teacher only supports `base64_dense`):
@@ -142,5 +115,13 @@ rg -n "Teacher endpoint error|prompt_len|positions_min|positions_max" runs/gold-
 - Ensure the teacher endpoint supports `full_logprobs` with `format="top_p"`.
 
 ## Notes
+- Run notes (2026-01-09)
+  - Observed: rollouts degenerate after ~40 steps (missing or corrupted `<|im_start|>`/`<|im_end|>` and extra user turns appear in completions).
+  - Observed: completion logs contained `<|im_start|>assistant` header and sometimes additional turns; prompt/completion boundaries looked misaligned.
+  - Observed: log file initially lacked step-by-step prompt/completion tables due to missing `rich` and stdout redirection.
+  - Approach: installed `rich`, routed `rich` output to stdout, and added a plain-text fallback so rollout tables land in `runs/gold-external-teacher/teacher_run.log`.
+  - Approach: fixed conversational prompt/completion extraction to split only on the final assistant turn (keep full history), and added stop candidates (`<|im_end|>`, `<|eot_id|>`, newline variants) plus trimming after stop.
+  - Approach: corrected stop-length and label slicing to use per-example prompt lengths (left padding) and trimmed completions to avoid training on extra turns.
+  - Status: still seeing extra user turns in some completions (needs further verification after latest restart).
 - Rollouts are logged to W&B via `wandb.Table` when `--log-rollouts` is enabled.
 - Secrets are loaded from `.env`; do not hardcode tokens in scripts.

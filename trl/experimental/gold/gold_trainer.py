@@ -16,6 +16,7 @@ import inspect
 import math
 import os
 import random
+import sys
 import textwrap
 import warnings
 from collections import defaultdict, deque
@@ -92,17 +93,50 @@ if is_bitsandbytes_available():
     import bitsandbytes as bnb
 
 
+def _print_prompt_completions_sample_plain(
+    prompts: list[str],
+    completions: list[str],
+    step: int,
+    num_samples: int | None = None,
+) -> None:
+    if not prompts or not completions:
+        return
+
+    if num_samples is not None:
+        if num_samples >= len(prompts):
+            num_samples = None
+        elif num_samples <= 0:
+            return
+
+    indices = list(range(len(prompts)))
+    if num_samples is not None:
+        indices = random.sample(indices, num_samples)
+
+    lines = [f"Step {step} prompt/completion samples ({len(indices)} of {len(prompts)}):"]
+    for i in indices:
+        lines.append("---")
+        lines.append("PROMPT:")
+        lines.append(prompts[i].rstrip())
+        lines.append("COMPLETION:")
+        lines.append(completions[i].rstrip())
+    lines.append("---")
+
+    stream = sys.__stdout__ or sys.stdout
+    stream.write("\n".join(lines) + "\n")
+    stream.flush()
+
+
 def print_prompt_completions_sample_uld(
     prompts: list[str],
     completions: list[str],
     step: int,
-    num_samples: int = None,
+    num_samples: int | None = None,
 ) -> None:
     """
     Print out a sample of model completions to the console with multiple reward metrics.
 
     This function creates a nicely formatted table showing prompt-completion pairs, useful for monitoring model outputs
-    during training. It requires the `rich` library to be installed.
+    during training. If `rich` is unavailable, it falls back to plain-text logging.
 
     Args:
         prompts (`list[str]`):
@@ -139,11 +173,9 @@ def print_prompt_completions_sample_uld(
     ```
     """
     if not is_rich_available():
-        raise ImportError(
-            "The function `print_prompt_completions_sample` requires the `rich` library. Please install it with "
-            "`pip install rich`."
-        )
-    console = Console()
+        _print_prompt_completions_sample_plain(prompts, completions, step, num_samples)
+        return
+    console = Console(file=(sys.__stdout__ or sys.stdout))
     table = Table(show_header=True, header_style="bold white", expand=True)
 
     # Add columns
@@ -241,13 +273,18 @@ def build_teacher_inputs_from_texts(
     tokenizer: PreTrainedTokenizerBase,
     prompt_texts: list[str],
     completion_texts: list[str],
+    *,
+    preserve_text: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-    """Tokenize teacher prompts/completions and produce tensors ready for GOLD loss."""
+    """Tokenize teacher prompts/completions and produce tensors ready for GOLD loss.
+
+    When `preserve_text=True`, no special tokens are added and no EOS is injected/stripped.
+    """
 
     pad_token_id = tokenizer.pad_token_id
     eos_token_id = tokenizer.eos_token_id
 
-    prompt_token_ids = tokenizer(prompt_texts, add_special_tokens=True)["input_ids"]
+    prompt_token_ids = tokenizer(prompt_texts, add_special_tokens=not preserve_text)["input_ids"]
     completion_token_ids = tokenizer(completion_texts, add_special_tokens=False)["input_ids"]
 
     sequences: list[torch.Tensor] = []
@@ -256,14 +293,15 @@ def build_teacher_inputs_from_texts(
     prompt_lengths: list[int] = []
 
     for prompt_ids, completion_ids in zip(prompt_token_ids, completion_token_ids, strict=True):
-        # Remove trailing EOS from prompt so completions can extend cleanly
-        if eos_token_id is not None and prompt_ids and prompt_ids[-1] == eos_token_id:
-            prompt_ids = prompt_ids[:-1]
+        if not preserve_text:
+            # Remove trailing EOS from prompt so completions can extend cleanly
+            if eos_token_id is not None and prompt_ids and prompt_ids[-1] == eos_token_id:
+                prompt_ids = prompt_ids[:-1]
 
         prompt_lengths.append(len(prompt_ids))
         sequence = list(prompt_ids)
         sequence.extend(completion_ids)
-        if eos_token_id is not None:
+        if not preserve_text and eos_token_id is not None:
             sequence.append(eos_token_id)
 
         seq_tensor = torch.tensor(sequence, dtype=torch.long)
@@ -284,7 +322,7 @@ def build_teacher_inputs_from_texts(
     teacher_attention_mask = pad(attention_masks, padding_side="right", padding_value=0).bool()
     teacher_labels = pad(labels_list, padding_side="right", padding_value=-100)
 
-    if eos_token_id is not None:
+    if not preserve_text and eos_token_id is not None:
         for row in range(teacher_attention_mask.size(0)):
             valid = (
                 teacher_input_ids[row] != pad_token_id
@@ -810,6 +848,11 @@ class GOLDTrainer(SFTTrainer):
         self.model_name_or_path = model if isinstance(model, str) else model.config._name_or_path
         self.model_revision = getattr(args, "student_model_revision", None)
         self.use_external_teacher_vllm = getattr(args, "use_external_teacher_vllm", False)
+        if self.use_external_teacher_vllm and getattr(args, "use_vllm", False):
+            raise ValueError(
+                "vLLM on-policy rollouts are disabled for external-teacher mode. "
+                "Remove `--use-vllm` to proceed."
+            )
         if isinstance(model, str) and self.model_revision is not None:
             args.model_init_kwargs = args.model_init_kwargs or {}
             args.model_init_kwargs.setdefault("revision", self.model_revision)
@@ -953,10 +996,32 @@ class GOLDTrainer(SFTTrainer):
         self.stop_sequences_vllm = []
         self.stop_strings_generate = []
         chat_template = getattr(self.processing_class, "chat_template", None)
-        if chat_template and "<|im_end|>" in chat_template:
-            self.stop_sequences_trim.append("<|im_end|>")
-            self.stop_sequences_vllm.append("<|im_end|>")
-            self.stop_strings_generate.append("<|im_end|>")
+        stop_candidates: list[str] = []
+        if chat_template:
+            if "<|im_end|>" in chat_template:
+                stop_candidates.append("<|im_end|>")
+            if "<|eot_id|>" in chat_template:
+                stop_candidates.append("<|eot_id|>")
+        eos_token = getattr(self.processing_class, "eos_token", None)
+        if eos_token and eos_token in ("<|im_end|>", "<|eot_id|>", "</s>", "<|endoftext|>"):
+            stop_candidates.append(eos_token)
+        for token in ("<|im_end|>", "<|eot_id|>"):
+            if token in getattr(self.processing_class, "additional_special_tokens", []):
+                stop_candidates.append(token)
+
+        seen = set()
+        stop_candidates = [s for s in stop_candidates if s and not (s in seen or seen.add(s))]
+        if stop_candidates:
+            expanded = []
+            for s in stop_candidates:
+                expanded.append(s)
+                if not s.endswith("\n"):
+                    expanded.append(s + "\n")
+            seen = set()
+            expanded = [s for s in expanded if s and not (s in seen or seen.add(s))]
+            self.stop_sequences_trim.extend(expanded)
+            self.stop_sequences_vllm.extend(expanded)
+            self.stop_strings_generate.extend(expanded)
 
         self.stop_sequence_ids_trim = []
         for seq in self.stop_sequences_trim:
@@ -966,24 +1031,14 @@ class GOLDTrainer(SFTTrainer):
                 seq_ids = []
             if seq_ids:
                 self.stop_sequence_ids_trim.append(seq_ids)
-        self.stop_sequence_ids_generate = []
+        self.stop_sequence_ids_generate = list(self.stop_sequence_ids_trim)
 
         if self.stop_sequence_ids_trim:
-            self.generation_config.eos_token_id = None
+            if len(self.stop_sequence_ids_trim) == 1 and len(self.stop_sequence_ids_trim[0]) == 1:
+                self.generation_config.eos_token_id = self.stop_sequence_ids_trim[0][0]
+            else:
+                self.generation_config.eos_token_id = None
 
-        self.uld_force_stop_token = getattr(args, "uld_force_stop_token", False)
-        self.uld_force_stop_token_prob = getattr(args, "uld_force_stop_token_prob", 0.99)
-        self.teacher_prompt_prefix = getattr(args, "teacher_prompt_prefix", None)
-        self.teacher_prompt_prefix_sep = getattr(args, "teacher_prompt_prefix_sep", "\n\n")
-        self.stop_sequence_ids_teacher = []
-        if self.teacher_tokenizer is not None and self.stop_sequences_trim:
-            for seq in self.stop_sequences_trim:
-                try:
-                    seq_ids = self.teacher_tokenizer.encode(seq, add_special_tokens=False)
-                except Exception:
-                    seq_ids = []
-                if seq_ids:
-                    self.stop_sequence_ids_teacher.append(seq_ids)
 
         # Initialize the metrics
         self._metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
@@ -1243,24 +1298,25 @@ class GOLDTrainer(SFTTrainer):
 
                 else:  # language modeling or conversational case
                     if is_conversational(example):
-                        # For conversational data (ChatML), extract prompt and completion properly
+                        # For conversational data (ChatML), keep full history and split only the final assistant turn.
                         messages = example["messages"]
+                        if messages:
+                            last_role = messages[-1].get("role")
+                            if last_role == "assistant":
+                                prompt_messages = messages[:-1]
+                                completion_messages = [messages[-1]]
+                            else:
+                                prompt_messages = messages
+                                completion_messages = []
 
-                        # Extract user and assistant messages separately
-                        user_messages = [msg for msg in messages if msg["role"] != "assistant"]
-                        assistant_messages = [msg for msg in messages if msg["role"] == "assistant"]
-
-                        if user_messages and assistant_messages:
-                            # Apply chat template to get the prompt (everything up to assistant)
                             prompt_text = processing_class.apply_chat_template(
-                                user_messages,
+                                prompt_messages,
                                 tokenize=False,
-                                add_generation_prompt=True,  # Add assistant prompt
+                                add_generation_prompt=True,
                                 **example.get("chat_template_kwargs", {}),
                             )
                             prompt_text = DataCollatorForChatML._append_chatml_generation_prompt(prompt_text)
 
-                            # Get the full conversation with assistant response
                             full_text = processing_class.apply_chat_template(
                                 messages,
                                 tokenize=False,
@@ -1268,29 +1324,23 @@ class GOLDTrainer(SFTTrainer):
                                 **example.get("chat_template_kwargs", {}),
                             )
 
-                            # Extract completion as everything after the prompt
-                            # This ensures we capture any extra tokens (like <think> tags) that the template adds
                             if full_text.startswith(prompt_text):
                                 completion_text = full_text[len(prompt_text) :]
-                            else:
-                                # Fallback: use assistant content + EOS
-                                assistant_content = assistant_messages[0]["content"]
+                            elif completion_messages:
+                                assistant_content = completion_messages[0]["content"]
                                 completion_text = (
                                     assistant_content + processing_class.eos_token
                                     if hasattr(processing_class, "eos_token")
                                     else assistant_content
                                 )
+                            else:
+                                completion_text = ""
 
-                            # Store original text for cross-tokenizer distillation
                             result["original_prompt_text"] = prompt_text
                             result["original_completion_text"] = completion_text
                         else:
-                            # Fallback: use empty prompt and full text as completion
-                            full_text = processing_class.apply_chat_template(
-                                messages, tokenize=False, **example.get("chat_template_kwargs", {})
-                            )
                             result["original_prompt_text"] = ""
-                            result["original_completion_text"] = full_text
+                            result["original_completion_text"] = ""
 
                         # Process the conversation normally
                         processed = processing_class.apply_chat_template(
@@ -1474,22 +1524,10 @@ class GOLDTrainer(SFTTrainer):
                 student_labels[student_labels == self.processing_class.pad_token_id] = -100
 
             student_answer_index, student_answer_size = self.uld_loss_fn._get_start_and_size_answers(student_labels)
-            if self.uld_loss_fn.skip_student_eos:
-                student_answer_size = [size - 1 for size in student_answer_size]
 
             max_teacher_tokens = getattr(self.args, "teacher_vllm_max_input_tokens", None)
             if max_teacher_tokens is not None:
                 max_teacher_tokens = int(max_teacher_tokens)
-                prefix_token_count = 0
-                if self.teacher_prompt_prefix and self.teacher_tokenizer is not None:
-                    sep = self.teacher_prompt_prefix_sep or ""
-                    prefix_text = f"{self.teacher_prompt_prefix}{sep}"
-                    try:
-                        prefix_token_count = len(
-                            self.teacher_tokenizer(prefix_text, add_special_tokens=False)["input_ids"]
-                        )
-                    except Exception:
-                        prefix_token_count = 0
                 prompt_texts = list(prompt_texts)
                 for i in range(len(prompt_texts)):
                     student_start = student_answer_index[i]
@@ -1497,7 +1535,7 @@ class GOLDTrainer(SFTTrainer):
                     if student_start <= 0 or student_size <= 0:
                         continue
                     # Keep margin proportional to completion length using student token counts.
-                    max_prompt_tokens = max_teacher_tokens - int(math.ceil(1.5 * student_size)) - prefix_token_count
+                    max_prompt_tokens = max_teacher_tokens - int(math.ceil(1.5 * student_size))
                     if max_prompt_tokens < 0:
                         max_prompt_tokens = 0
                     if student_start > max_prompt_tokens:
@@ -1512,14 +1550,11 @@ class GOLDTrainer(SFTTrainer):
                             clean_up_tokenization_spaces=False,
                         )
 
-            if self.teacher_prompt_prefix:
-                sep = self.teacher_prompt_prefix_sep or ""
-                prompt_texts = [f"{self.teacher_prompt_prefix}{sep}{prompt}" for prompt in prompt_texts]
-
             teacher_input_ids, teacher_labels, teacher_attention_mask, _ = build_teacher_inputs_from_texts(
                 self.teacher_tokenizer,
                 prompt_texts,
                 completion_texts,
+                preserve_text=True,
             )
 
             outputs_student = model(
@@ -1535,9 +1570,6 @@ class GOLDTrainer(SFTTrainer):
 
             teacher_answer_index, teacher_answer_size = self.uld_loss_fn._get_start_and_size_answers(teacher_labels)
 
-            if self.uld_loss_fn.skip_teacher_eos:
-                teacher_answer_size = [size - 1 for size in teacher_answer_size]
-
             distillation_losses: list[torch.Tensor] = []
             matched_losses: list[torch.Tensor] = []
             unmatched_losses: list[torch.Tensor] = []
@@ -1552,23 +1584,6 @@ class GOLDTrainer(SFTTrainer):
                     if student_size <= 0 or teacher_size <= 0 or student_start <= 0 or teacher_start <= 0:
                         distillation_losses.append(outputs_student.logits[i].sum() * 0.0)
                         continue
-
-                    if self.stop_sequence_ids_trim:
-                        completion_tokens = inputs["input_ids"][i, student_start : student_start + student_size].tolist()
-                        cut = None
-                        for stop_seq in self.stop_sequence_ids_trim:
-                            stop_len = len(stop_seq)
-                            if stop_len == 0 or len(completion_tokens) < stop_len:
-                                continue
-                            for pos in range(0, len(completion_tokens) - stop_len + 1):
-                                if completion_tokens[pos : pos + stop_len] == stop_seq:
-                                    cut = pos if cut is None else min(cut, pos)
-                                    break
-                        if cut is not None:
-                            student_size = min(student_size, cut)
-                            if student_size <= 0:
-                                distillation_losses.append(outputs_student.logits[i].sum() * 0.0)
-                                continue
 
                     teacher_token_ids_full = teacher_input_ids[i, : int(teacher_attention_mask[i].sum().item())].tolist()
                     teacher_seq_len = len(teacher_token_ids_full)
@@ -1622,34 +1637,6 @@ class GOLDTrainer(SFTTrainer):
                         min_length = min(len(student_token_ids), len(teacher_token_ids))
                         student_aligned = student_probs[:min_length, :]
                         teacher_aligned = teacher_probs[:min_length, :]
-
-                    if self.uld_force_stop_token:
-                        stop_token_ids = []
-                        if (
-                            self.uld_loss_fn is not None
-                            and getattr(self.uld_loss_fn, "_student_to_teacher", None) is not None
-                            and self.stop_sequence_ids_trim
-                        ):
-                            for student_id in self.stop_sequence_ids_trim[0]:
-                                teacher_id = self.uld_loss_fn._student_to_teacher.get(student_id)
-                                if teacher_id is None:
-                                    stop_token_ids = []
-                                    break
-                                stop_token_ids.append(teacher_id)
-                        if not stop_token_ids and self.stop_sequence_ids_teacher:
-                            stop_token_ids = self.stop_sequence_ids_teacher[0]
-                        if stop_token_ids:
-                            if self.stop_sequence_ids_trim:
-                                target_len = len(self.stop_sequence_ids_trim[0])
-                            else:
-                                target_len = len(stop_token_ids)
-                            start_idx = max(0, teacher_aligned.size(0) - target_len)
-                            teacher_aligned = self._apply_stop_token_prior(
-                                teacher_aligned,
-                                stop_token_ids,
-                                start_idx=start_idx,
-                                target_len=target_len,
-                            )
 
                     if self.uld_loss_fn.use_hybrid_loss and self.uld_loss_fn._vocab_mapping is not None:
                         aligned_loss = self.uld_loss_fn._compute_hybrid_uld_loss(student_aligned, teacher_aligned)
@@ -1913,6 +1900,20 @@ class GOLDTrainer(SFTTrainer):
 
         return (loss, outputs_student) if return_outputs else loss
 
+    @staticmethod
+    def _strip_leading_assistant_prompt(prompt_text: str, completion_text: str) -> str:
+        if not prompt_text or not completion_text:
+            return completion_text
+        prefix = "<|im_start|>assistant"
+        if prompt_text.rstrip().endswith(prefix):
+            stripped = completion_text.lstrip()
+            if stripped.startswith(prefix):
+                stripped = stripped[len(prefix) :]
+                if stripped.startswith("\n"):
+                    stripped = stripped[1:]
+                return stripped
+        return completion_text
+
     def generate_on_policy_outputs(self, model, inputs, generation_config, pad_token_id=None):
         # Generate output with respect to the prompt only
         prompt_mask = inputs.get("prompt_attention_mask")
@@ -1963,12 +1964,26 @@ class GOLDTrainer(SFTTrainer):
         else:
             stopping_criteria = None
             if self.stop_sequence_ids_generate:
-                start_length = int(inputs["prompts"].shape[1])
+                if prompt_mask is not None:
+                    start_length = [int(mask.sum().item()) for mask in prompt_mask]
+                elif pad_token_id is not None:
+                    start_length = [
+                        int((row != pad_token_id).sum().item()) for row in inputs["prompts"]
+                    ]
+                else:
+                    start_length = [int(inputs["prompts"].shape[1])] * int(inputs["prompts"].shape[0])
                 stopping_criteria = StoppingCriteriaList(
                     [StopSequenceCriteria(self.stop_sequence_ids_generate, start_length)]
                 )
             elif self.stop_strings_generate:
-                start_length = int(inputs["prompts"].shape[1])
+                if prompt_mask is not None:
+                    start_length = [int(mask.sum().item()) for mask in prompt_mask]
+                elif pad_token_id is not None:
+                    start_length = [
+                        int((row != pad_token_id).sum().item()) for row in inputs["prompts"]
+                    ]
+                else:
+                    start_length = [int(inputs["prompts"].shape[1])] * int(inputs["prompts"].shape[0])
                 stopping_criteria = StoppingCriteriaList(
                     [StopAfterPromptCriteria(self.processing_class, self.stop_strings_generate, start_length)]
                 )
@@ -2000,37 +2015,48 @@ class GOLDTrainer(SFTTrainer):
                     device=device,
                 )
 
-        stop_seqs = self.stop_sequence_ids_trim
-        if stop_seqs:
-            input_seq_len = inputs["prompts"].shape[1]
-            for idx in range(generated_tokens.size(0)):
-                seq = generated_tokens[idx]
-                found = None
-                for stop_seq in stop_seqs:
-                    stop_len = len(stop_seq)
-                    if seq.numel() < input_seq_len + stop_len:
-                        continue
-                    stop_tensor = torch.tensor(stop_seq, device=seq.device)
-                    for pos in range(input_seq_len, seq.numel() - stop_len + 1):
-                        if torch.equal(seq[pos : pos + stop_len], stop_tensor):
-                            found = pos if found is None else min(found, pos)
-                            break
-                if found is not None and pad_token_id is not None and found < seq.numel():
-                    seq[found:] = pad_token_id
-
         new_input_ids = generated_tokens
-        input_seq_len = inputs["prompts"].shape[1]
-        completion_start = input_seq_len if new_input_ids.shape[1] >= input_seq_len else 0
+        stop_positions = None
+        if self.stop_sequence_ids_trim:
+            stop_positions = [None] * batch_size
+            stop_seqs = [seq for seq in self.stop_sequence_ids_trim if seq]
+            for idx in range(batch_size):
+                start = int(prompt_lengths[idx].item())
+                if start <= 0:
+                    continue
+                seq = new_input_ids[idx].tolist()
+                stop_pos = None
+                for stop_seq in stop_seqs:
+                    max_start = len(seq) - len(stop_seq)
+                    for pos in range(start, max_start + 1):
+                        if seq[pos : pos + len(stop_seq)] == stop_seq:
+                            stop_pos = pos + len(stop_seq)
+                            break
+                    if stop_pos is not None:
+                        break
+                if stop_pos is not None:
+                    stop_positions[idx] = stop_pos
         new_attention_mask = torch.ones_like(new_input_ids)
         if pad_token_id is not None:
             new_attention_mask[new_input_ids == pad_token_id] = 0
 
         new_labels = torch.full_like(new_input_ids, -100)
-        if completion_start < new_input_ids.shape[1]:
-            new_labels[:, completion_start:] = new_input_ids[:, completion_start:]
+        for idx in range(batch_size):
+            start = int(prompt_lengths[idx].item())
+            if start < new_input_ids.shape[1]:
+                new_labels[idx, start:] = new_input_ids[idx, start:]
 
         if pad_token_id is not None:
             new_labels[new_input_ids == pad_token_id] = -100
+
+        if stop_positions:
+            for idx, stop_pos in enumerate(stop_positions):
+                if stop_pos is None:
+                    continue
+                if pad_token_id is not None:
+                    new_input_ids[idx, stop_pos:] = pad_token_id
+                new_attention_mask[idx, stop_pos:] = 0
+                new_labels[idx, stop_pos:] = -100
 
         prompt_texts = []
         completion_texts = []
@@ -2048,7 +2074,7 @@ class GOLDTrainer(SFTTrainer):
                     clean_up_tokenization_spaces=False,
                 )
             )
-            completion_tokens = new_input_ids[idx, completion_start:]
+            completion_tokens = new_input_ids[idx, int(prompt_lengths[idx].item()) :]
             if pad_token_id is not None:
                 completion_tokens = completion_tokens[completion_tokens != pad_token_id]
             completion_texts.append(
@@ -2058,6 +2084,11 @@ class GOLDTrainer(SFTTrainer):
                     clean_up_tokenization_spaces=False,
                 )
             )
+
+        completion_texts = [
+            self._strip_leading_assistant_prompt(prompt_texts[i], completion_texts[i])
+            for i in range(batch_size)
+        ]
 
         return new_input_ids, new_attention_mask, new_labels, prompt_texts, completion_texts
 
@@ -2174,20 +2205,6 @@ class GOLDTrainer(SFTTrainer):
         else:
             raise ValueError(f"Unknown vllm_mode: {self.vllm_mode}")
 
-        stop_seq_ids = self.stop_sequence_ids_trim
-        if stop_seq_ids:
-            trimmed = []
-            for ids in completion_ids:
-                cut = None
-                for stop_seq in stop_seq_ids:
-                    stop_len = len(stop_seq)
-                    for pos in range(0, max(0, len(ids) - stop_len + 1)):
-                        if ids[pos : pos + stop_len] == stop_seq:
-                            cut = pos if cut is None else min(cut, pos)
-                            break
-                trimmed.append(ids[:cut] if cut is not None else ids)
-            completion_ids = trimmed
-
         # We need to combine prompt and completion for new_input_ids
         # Tokenize prompts again to get prompt_ids on the correct device and format
         # Use prompts_text_for_vllm (without special tokens) for tokenization since vLLM expects clean text
@@ -2254,6 +2271,11 @@ class GOLDTrainer(SFTTrainer):
         for comp_ids in completion_ids:
             completion_text = self.processing_class.decode(comp_ids, skip_special_tokens=False)
             completion_texts.append(completion_text)
+
+        completion_texts = [
+            self._strip_leading_assistant_prompt(prompts_text_with_special[i], completion_texts[i])
+            for i in range(len(completion_texts))
+        ]
 
         return new_input_ids, new_attention_mask, new_labels, prompts_text_with_special, completion_texts
 
@@ -2359,35 +2381,6 @@ class GOLDTrainer(SFTTrainer):
             empty_cache()
             self.vllm_engine.wake_up(tags=["kv_cache"])
 
-    def _apply_stop_token_prior(
-        self,
-        teacher_probs: torch.Tensor,
-        stop_token_ids: list[int],
-        *,
-        start_idx: int,
-        target_len: int,
-    ) -> torch.Tensor:
-        if teacher_probs.numel() == 0 or not stop_token_ids or target_len <= 0:
-            return teacher_probs
-        seq_len, vocab_size = teacher_probs.size(0), teacher_probs.size(-1)
-        if vocab_size <= 0:
-            return teacher_probs
-
-        force_prob = float(self.uld_force_stop_token_prob)
-        for offset in range(target_len):
-            if offset >= len(stop_token_ids):
-                break
-            stop_id = stop_token_ids[offset]
-            if stop_id < 0 or stop_id >= vocab_size:
-                continue
-            row_idx = start_idx + offset
-            if row_idx < 0 or row_idx >= seq_len:
-                continue
-            forced = torch.zeros((vocab_size,), device=teacher_probs.device, dtype=teacher_probs.dtype)
-            forced[stop_id] = force_prob
-            teacher_probs[row_idx] = forced
-        return teacher_probs
-
     @profiling_decorator
     def training_step(
         self, model: nn.Module, inputs: dict[str, torch.Tensor | Any], num_items_in_batch: int | None = None
@@ -2428,8 +2421,10 @@ class GOLDTrainer(SFTTrainer):
             inputs["original_completion_text"] = completion_texts
 
             # Log prompt and completion texts
-            self._textual_logs["prompt"].extend(gather_object(prompt_texts))
-            self._textual_logs["completion"].extend(gather_object(completion_texts))
+            gathered_prompts = gather_object(prompt_texts)
+            gathered_completions = gather_object(completion_texts)
+            self._textual_logs["prompt"].extend(gathered_prompts)
+            self._textual_logs["completion"].extend(gathered_completions)
 
         loss = super().training_step(model, inputs, num_items_in_batch)
 
@@ -2444,6 +2439,40 @@ class GOLDTrainer(SFTTrainer):
             self._off_policy_loss_total += loss_scalar
             self._off_policy_step_equiv += step_equiv
         return loss
+
+    def _log_completion_table_step(self, prompts: list[str], completions: list[str]) -> None:
+        if not (
+            self.accelerator.is_main_process
+            and self.log_completions
+            and self.args.report_to
+            and "wandb" in self.args.report_to
+            and is_wandb_available()
+            and wandb.run is not None
+        ):
+            return
+        if not prompts or not completions:
+            return
+
+        if self.wandb_log_unique_prompts:
+            seen = set()
+            unique_prompts = []
+            unique_completions = []
+            for prompt, completion in zip(prompts, completions, strict=True):
+                if prompt in seen:
+                    continue
+                seen.add(prompt)
+                unique_prompts.append(prompt)
+                unique_completions.append(completion)
+            prompts = unique_prompts
+            completions = unique_completions
+
+        indices = list(range(len(prompts)))
+        if self.num_completions_to_print and len(indices) > self.num_completions_to_print:
+            indices = random.sample(indices, self.num_completions_to_print)
+
+        data = [[int(self.state.global_step), prompts[i], completions[i]] for i in indices]
+        table = wandb.Table(columns=["global_step", "prompt", "completion"], data=data)
+        wandb.log({"completions": table})
 
     def log(self, logs: dict[str, float], start_time: float | None = None) -> None:
         mode = "train" if self.model.training else "eval"
@@ -2527,17 +2556,7 @@ class GOLDTrainer(SFTTrainer):
                     self.num_completions_to_print,
                 )
 
-            if self.args.report_to and "wandb" in self.args.report_to and wandb.run is not None:
-                import pandas as pd
-
-                table = {
-                    "step": [str(self.state.global_step)] * len(self._textual_logs["prompt"]),
-                    "prompt": self._textual_logs["prompt"],
-                    "completion": self._textual_logs["completion"],
-                }
-                df = pd.DataFrame(table)
-                if self.wandb_log_unique_prompts:
-                    df = df.drop_duplicates(subset=["prompt"])
-                if self.num_completions_to_print and len(df) > 0:
-                    df = df.sample(n=self.num_completions_to_print, random_state=42)
-                wandb.log({"completions": wandb.Table(dataframe=df)})
+            self._log_completion_table_step(
+                list(self._textual_logs["prompt"]),
+                list(self._textual_logs["completion"]),
+            )
