@@ -122,6 +122,6 @@ rg -n "Teacher endpoint error|prompt_len|positions_min|positions_max" runs/gold-
   - Approach: installed `rich`, routed `rich` output to stdout, and added a plain-text fallback so rollout tables land in `runs/gold-external-teacher/teacher_run.log`.
   - Approach: fixed conversational prompt/completion extraction to split only on the final assistant turn (keep full history), and added stop candidates (`<|im_end|>`, `<|eot_id|>`, newline variants) plus trimming after stop.
   - Approach: corrected stop-length and label slicing to use per-example prompt lengths (left padding) and trimmed completions to avoid training on extra turns.
-  - Status: still seeing extra user turns in some completions (needs further verification after latest restart).
+  - Status: current run still shows extra user turns in some completions when inspecting samples; degeneration persists.
 - Rollouts are logged to W&B via `wandb.Table` when `--log-rollouts` is enabled.
 - Secrets are loaded from `.env`; do not hardcode tokens in scripts.
