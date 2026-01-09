@@ -117,11 +117,14 @@ rg -n "Teacher endpoint error|prompt_len|positions_min|positions_max" runs/gold-
 ## Notes
 - Run notes (2026-01-09)
   - Observed: rollouts degenerate after ~40 steps (missing or corrupted `<|im_start|>`/`<|im_end|>` and extra user turns appear in completions).
-  - Observed: completion logs contained `<|im_start|>assistant` header and sometimes additional turns; prompt/completion boundaries looked misaligned.
+  - Observed: completion logs included `<|im_start|>assistant` and sometimes subsequent user/assistant turns; prompt/completion boundary looked misaligned.
+  - Observed: prompt logs sometimes start with an assistant turn (dataset may begin with assistant content, or prompt extraction may include an initial assistant message).
   - Observed: log file initially lacked step-by-step prompt/completion tables due to missing `rich` and stdout redirection.
+  - Observed: stop behavior was inconsistent when using left-padded prompts; completions could include extra turns even when `--log-rollouts-steps 1` was enabled.
   - Approach: installed `rich`, routed `rich` output to stdout, and added a plain-text fallback so rollout tables land in `runs/gold-external-teacher/teacher_run.log`.
-  - Approach: fixed conversational prompt/completion extraction to split only on the final assistant turn (keep full history), and added stop candidates (`<|im_end|>`, `<|eot_id|>`, newline variants) plus trimming after stop.
-  - Approach: corrected stop-length and label slicing to use per-example prompt lengths (left padding) and trimmed completions to avoid training on extra turns.
-  - Status: current run still shows extra user turns in some completions when inspecting samples; degeneration persists.
+  - Approach: fixed conversational prompt/completion extraction to split only on the final assistant turn (keep full history), and preserved prompt/completion text for ULD alignment.
+  - Approach: expanded stop candidates to include `<|im_end|>`, `<|eot_id|>`, and newline variants derived from chat template/special tokens; added post-generation trimming after the first stop marker.
+  - Approach: corrected stop-length handling and label/completion slicing to use per-example prompt lengths (left padding) instead of global prompt length.
+  - Status: current run still shows extra user turns in some completions when inspecting samples; degeneration persists and needs further investigation.
 - Rollouts are logged to W&B via `wandb.Table` when `--log-rollouts` is enabled.
 - Secrets are loaded from `.env`; do not hardcode tokens in scripts.
