@@ -296,8 +296,7 @@ class DataCollatorForChatML:
             return prompt_ids
         if len(prompt_ids) >= len(suffix_ids) and prompt_ids[-len(suffix_ids) :] == suffix_ids:
             return prompt_ids
-        if formatted_prompt.rstrip().endswith("<|im_start|>assistant"):
-            return prompt_ids
+        # Append if missing: tokenization may have truncated the generation prompt.
         return prompt_ids + suffix_ids
 
 

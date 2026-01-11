@@ -734,27 +734,54 @@ class ULDLoss(nn.Module):
         unmatched_loss = torch.tensor(0.0, device=device)
         use_unmatched = not (self.hybrid_unmatched_weight is not None and self.hybrid_unmatched_weight == 0.0)
         if use_unmatched and teacher_unmatched_probs.size(-1) > 0 and student_unmatched_probs.size(-1) > 0:
-            # Sort unmatched probabilities
-            teacher_unmatched_sorted = teacher_unmatched_probs.sort(dim=-1, descending=True).values
-            student_unmatched_sorted = student_unmatched_probs.sort(dim=-1, descending=True).values
+            # When teacher logprobs are sparse (e.g., top_p), missing tokens become 0 after softmax.
+            # Ignore those positions to avoid forcing the student to zero on the unseen tail.
+            if (teacher_unmatched_probs == 0).any():
+                per_row_losses = []
+                for row in range(teacher_unmatched_probs.size(0)):
+                    teacher_row = teacher_unmatched_probs[row]
+                    valid = teacher_row > 0
+                    if not valid.any():
+                        continue
+                    teacher_vals = teacher_row[valid]
+                    k = int(teacher_vals.numel())
+                    if k <= 0:
+                        continue
+                    student_row = student_unmatched_probs[row]
+                    if k < student_row.numel():
+                        student_vals = torch.topk(student_row, k, dim=-1).values
+                    else:
+                        student_vals = student_row
+                    teacher_sorted = teacher_vals.sort(descending=True).values
+                    student_sorted = student_vals.sort(descending=True).values
+                    min_len = min(student_sorted.numel(), teacher_sorted.numel())
+                    if min_len == 0:
+                        continue
+                    per_row_losses.append(
+                        F.l1_loss(student_sorted[:min_len], teacher_sorted[:min_len], reduction="sum")
+                    )
+                if per_row_losses:
+                    unmatched_loss = torch.stack(per_row_losses).sum() / max(1, student_aligned.size(0))
+            else:
+                # Dense teacher distribution: use original sorted L1 on unmatched tokens.
+                teacher_unmatched_sorted = teacher_unmatched_probs.sort(dim=-1, descending=True).values
+                student_unmatched_sorted = student_unmatched_probs.sort(dim=-1, descending=True).values
 
-            # Pad to same size if needed
-            teacher_unmatched_size = teacher_unmatched_sorted.size(-1)
-            student_unmatched_size = student_unmatched_sorted.size(-1)
-            max_unmatched_size = max(teacher_unmatched_size, student_unmatched_size)
+                teacher_unmatched_size = teacher_unmatched_sorted.size(-1)
+                student_unmatched_size = student_unmatched_sorted.size(-1)
+                max_unmatched_size = max(teacher_unmatched_size, student_unmatched_size)
 
-            if teacher_unmatched_size < max_unmatched_size:
-                teacher_unmatched_sorted = F.pad(
-                    teacher_unmatched_sorted, (0, max_unmatched_size - teacher_unmatched_size)
-                )
-            if student_unmatched_size < max_unmatched_size:
-                student_unmatched_sorted = F.pad(
-                    student_unmatched_sorted, (0, max_unmatched_size - student_unmatched_size)
-                )
+                if teacher_unmatched_size < max_unmatched_size:
+                    teacher_unmatched_sorted = F.pad(
+                        teacher_unmatched_sorted, (0, max_unmatched_size - teacher_unmatched_size)
+                    )
+                if student_unmatched_size < max_unmatched_size:
+                    student_unmatched_sorted = F.pad(
+                        student_unmatched_sorted, (0, max_unmatched_size - student_unmatched_size)
+                    )
 
-            # L1 loss on sorted unmatched tokens
-            unmatched_loss = F.l1_loss(student_unmatched_sorted, teacher_unmatched_sorted, reduction="sum")
-            unmatched_loss /= student_aligned.size(0)  # Normalize by sequence length
+                unmatched_loss = F.l1_loss(student_unmatched_sorted, teacher_unmatched_sorted, reduction="sum")
+                unmatched_loss /= student_aligned.size(0)  # Normalize by sequence length
 
         # 3. Combine losses with weights
         if self.hybrid_matched_weight is None:
@@ -1014,9 +1041,14 @@ class GOLDTrainer(SFTTrainer):
         if stop_candidates:
             expanded = []
             for s in stop_candidates:
-                expanded.append(s)
+                variants = [s]
+                if s.startswith("<|") and not s.startswith(" "):
+                    variants.append(" " + s)
                 if not s.endswith("\n"):
-                    expanded.append(s + "\n")
+                    variants.append(s + "\n")
+                    if s.startswith("<|") and not s.startswith(" "):
+                        variants.append(" " + s + "\n")
+                expanded.extend(variants)
             seen = set()
             expanded = [s for s in expanded if s and not (s in seen or seen.add(s))]
             self.stop_sequences_trim.extend(expanded)
@@ -1918,6 +1950,28 @@ class GOLDTrainer(SFTTrainer):
         # Generate output with respect to the prompt only
         prompt_mask = inputs.get("prompt_attention_mask")
         pad_token_id = pad_token_id if pad_token_id is not None else self.processing_class.pad_token_id
+        prompts_tensor = inputs["prompts"]
+        if prompt_mask is not None:
+            prompt_lengths = prompt_mask.sum(dim=1).to(torch.long)
+        elif pad_token_id is not None:
+            prompt_lengths = (prompts_tensor != pad_token_id).sum(dim=1).to(torch.long)
+        else:
+            prompt_lengths = torch.full(
+                (prompts_tensor.shape[0],),
+                prompts_tensor.shape[1],
+                dtype=torch.long,
+                device=prompts_tensor.device,
+            )
+
+        prompt_ends = prompt_lengths
+        if not self.use_transformers_paged and pad_token_id is not None:
+            # Prompts are left-padded in the collator even when the tokenizer pads on the right.
+            if prompt_mask is not None:
+                left_padded = bool((prompt_mask[:, 0] == 0).any().item())
+            else:
+                left_padded = bool((prompts_tensor[:, 0] == pad_token_id).any().item())
+            if left_padded:
+                prompt_ends = torch.full_like(prompt_lengths, prompts_tensor.shape[1])
         if self.use_transformers_paged:
             previous_attn = self.model.config._attn_implementation
             if is_flash_attn_2_available():
@@ -1962,31 +2016,16 @@ class GOLDTrainer(SFTTrainer):
             completion_ids = [output.generated_tokens for output in generated_outputs.values()]
             generated_tokens = torch.stack([torch.tensor(ids, device=model.device) for ids in completion_ids])
         else:
-            stopping_criteria = None
+            stopping_criteria_list = []
             if self.stop_sequence_ids_generate:
-                if prompt_mask is not None:
-                    start_length = [int(mask.sum().item()) for mask in prompt_mask]
-                elif pad_token_id is not None:
-                    start_length = [
-                        int((row != pad_token_id).sum().item()) for row in inputs["prompts"]
-                    ]
-                else:
-                    start_length = [int(inputs["prompts"].shape[1])] * int(inputs["prompts"].shape[0])
-                stopping_criteria = StoppingCriteriaList(
-                    [StopSequenceCriteria(self.stop_sequence_ids_generate, start_length)]
+                start_length = [int(value) for value in prompt_ends.tolist()]
+                stopping_criteria_list.append(StopSequenceCriteria(self.stop_sequence_ids_generate, start_length))
+            if self.stop_strings_generate:
+                start_length = [int(value) for value in prompt_ends.tolist()]
+                stopping_criteria_list.append(
+                    StopAfterPromptCriteria(self.processing_class, self.stop_strings_generate, start_length)
                 )
-            elif self.stop_strings_generate:
-                if prompt_mask is not None:
-                    start_length = [int(mask.sum().item()) for mask in prompt_mask]
-                elif pad_token_id is not None:
-                    start_length = [
-                        int((row != pad_token_id).sum().item()) for row in inputs["prompts"]
-                    ]
-                else:
-                    start_length = [int(inputs["prompts"].shape[1])] * int(inputs["prompts"].shape[0])
-                stopping_criteria = StoppingCriteriaList(
-                    [StopAfterPromptCriteria(self.processing_class, self.stop_strings_generate, start_length)]
-                )
+            stopping_criteria = StoppingCriteriaList(stopping_criteria_list) if stopping_criteria_list else None
             generation_kwargs = {
                 "input_ids": inputs["prompts"],
                 "attention_mask": inputs.get("prompt_attention_mask", None),
@@ -2001,19 +2040,8 @@ class GOLDTrainer(SFTTrainer):
 
         batch_size = generated_tokens.size(0)
         device = generated_tokens.device
-
-        if prompt_mask is not None:
-            prompt_lengths = prompt_mask.sum(dim=1).to(torch.long)
-        else:
-            if pad_token_id is not None:
-                prompt_lengths = (inputs["prompts"] != pad_token_id).sum(dim=1).to(torch.long)
-            else:
-                prompt_lengths = torch.full(
-                    (batch_size,),
-                    inputs["prompts"].shape[1],
-                    dtype=torch.long,
-                    device=device,
-                )
+        prompt_lengths = prompt_lengths.to(device)
+        prompt_ends = prompt_ends.to(device)
 
         new_input_ids = generated_tokens
         stop_positions = None
@@ -2021,7 +2049,7 @@ class GOLDTrainer(SFTTrainer):
             stop_positions = [None] * batch_size
             stop_seqs = [seq for seq in self.stop_sequence_ids_trim if seq]
             for idx in range(batch_size):
-                start = int(prompt_lengths[idx].item())
+                start = int(prompt_ends[idx].item())
                 if start <= 0:
                     continue
                 seq = new_input_ids[idx].tolist()
@@ -2042,9 +2070,9 @@ class GOLDTrainer(SFTTrainer):
 
         new_labels = torch.full_like(new_input_ids, -100)
         for idx in range(batch_size):
-            start = int(prompt_lengths[idx].item())
-            if start < new_input_ids.shape[1]:
-                new_labels[idx, start:] = new_input_ids[idx, start:]
+            prompt_end = int(prompt_ends[idx].item())
+            if prompt_end < new_input_ids.shape[1]:
+                new_labels[idx, prompt_end:] = new_input_ids[idx, prompt_end:]
 
         if pad_token_id is not None:
             new_labels[new_input_ids == pad_token_id] = -100
@@ -2074,7 +2102,7 @@ class GOLDTrainer(SFTTrainer):
                     clean_up_tokenization_spaces=False,
                 )
             )
-            completion_tokens = new_input_ids[idx, int(prompt_lengths[idx].item()) :]
+            completion_tokens = new_input_ids[idx, int(prompt_ends[idx].item()) :]
             if pad_token_id is not None:
                 completion_tokens = completion_tokens[completion_tokens != pad_token_id]
             completion_texts.append(

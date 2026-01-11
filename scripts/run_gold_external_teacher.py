@@ -305,16 +305,6 @@ def main() -> None:
         default=None,
         help="Max teacher input tokens for external endpoint (truncates from left).",
     )
-    parser.add_argument(
-        "--teacher-system-prompt",
-        default=None,
-        help="Optional system prompt prefix injected into teacher prompts.",
-    )
-    parser.add_argument(
-        "--teacher-system-prompt-sep",
-        default="\\n\\n",
-        help="Separator between teacher system prompt and the original prompt.",
-    )
     parser.add_argument("--teacher-preflight-requests", type=int, default=3)
     parser.add_argument("--teacher-preflight-min-success", type=int, default=1)
     parser.add_argument("--output-dir", default="runs/gold-external-teacher")
@@ -324,20 +314,27 @@ def main() -> None:
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--max-completion-length", type=int, default=64)
     parser.add_argument("--max-length", type=int, default=None)
+    parser.add_argument(
+        "--student-temperature",
+        type=float,
+        default=0.9,
+        help="Sampling temperature for student rollouts.",
+    )
+    parser.add_argument(
+        "--student-top-p",
+        type=float,
+        default=0.95,
+        help="Top-p nucleus sampling for student rollouts.",
+    )
+    parser.add_argument(
+        "--student-top-k",
+        type=int,
+        default=0,
+        help="Top-k sampling for student rollouts (0 disables).",
+    )
     parser.add_argument("--teacher-port", type=int, default=0)
     parser.add_argument("--learning-rate", type=float, default=1e-6)
     parser.add_argument("--min-new-tokens", type=int, default=None, help="Force a minimum number of generated tokens.")
-    parser.add_argument(
-        "--force-stop-token",
-        action="store_true",
-        help="Inject a strong teacher prior on the stop token when the student misses it.",
-    )
-    parser.add_argument(
-        "--force-stop-token-prob",
-        type=float,
-        default=0.99,
-        help="Target probability for the forced stop token prior (remainder spread uniformly).",
-    )
     parser.add_argument(
         "--disable-unmatched-loss",
         action="store_true",
@@ -467,11 +464,11 @@ def main() -> None:
 
         if args.teacher_preflight_requests > 0:
             sample_messages = dataset[0]["messages"]
-            teacher_text = teacher_tokenizer.apply_chat_template(
+            student_text = tokenizer.apply_chat_template(
                 sample_messages, tokenize=False, add_generation_prompt=False
             )
             teacher_ids = teacher_tokenizer(
-                teacher_text, add_special_tokens=False, truncation=False, padding=False, return_tensors=None
+                student_text, add_special_tokens=False, truncation=False, padding=False, return_tensors=None
             )["input_ids"]
             if args.teacher_max_input_tokens is not None and len(teacher_ids) > args.teacher_max_input_tokens:
                 teacher_ids = teacher_ids[-args.teacher_max_input_tokens :]
@@ -528,6 +525,9 @@ def main() -> None:
             eval_strategy="no",
             max_completion_length=max_completion_length,
             max_length=max_length,
+            temperature=args.student_temperature,
+            top_p=args.student_top_p,
+            top_k=args.student_top_k,
             lmbda=1.0,
             use_external_teacher_vllm=True,
             teacher_vllm_base_url=teacher_url,
@@ -546,10 +546,6 @@ def main() -> None:
             vllm_tensor_parallel_size=args.vllm_tensor_parallel_size,
             vllm_sync_frequency=args.vllm_sync_frequency,
             vllm_enable_sleep_mode=args.vllm_enable_sleep_mode,
-            uld_force_stop_token=args.force_stop_token,
-            uld_force_stop_token_prob=args.force_stop_token_prob,
-            teacher_prompt_prefix=args.teacher_system_prompt,
-            teacher_prompt_prefix_sep=args.teacher_system_prompt_sep,
         )
         if args.disable_unmatched_loss:
             train_args.uld_hybrid_matched_weight = 1.0
