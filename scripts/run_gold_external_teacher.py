@@ -325,6 +325,12 @@ def main() -> None:
         help="Maximum top-k per position for sparse full_logprobs format.",
     )
     parser.add_argument(
+        "--uld-crossentropy-weight",
+        type=float,
+        default=0.0,
+        help="Weight for the cross-entropy loss component in ULD loss.",
+    )
+    parser.add_argument(
         "--teacher-max-input-tokens",
         type=int,
         default=None,
@@ -673,6 +679,7 @@ def main() -> None:
             teacher_vllm_fail_on_error=True,
             teacher_tokenizer_name_or_path=args.teacher_tokenizer,
             uld_teacher_temperature=args.teacher_temperature,
+            uld_crossentropy_weight=args.uld_crossentropy_weight,
             use_vllm=args.use_vllm,
             vllm_mode=args.vllm_mode,
             vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,

@@ -775,7 +775,7 @@ class ULDLoss(nn.Module):
             teacher_matched_mask[teacher_matched_indices] = True
             student_matched_mask[student_matched_indices] = True
 
-        # 1. Reverse KL on matched vocabulary tokens (direct semantic correspondence)
+        # 1. Jensen-Shannon divergence on matched vocabulary tokens (direct semantic correspondence)
         matched_loss = torch.tensor(0.0, device=device)
         matched_token_count = 0
         if len(teacher_matched_indices) > 0:
@@ -785,6 +785,8 @@ class ULDLoss(nn.Module):
             matched_token_count = teacher_matched_probs.size(-1)
 
             eps = 1e-8
+            beta = float(self.beta) if self.beta is not None else 0.5
+            beta = min(max(beta, 0.0), 1.0)
             if (teacher_matched_probs == 0).any():
                 per_row_losses = []
                 for row in range(teacher_matched_probs.size(0)):
@@ -796,14 +798,22 @@ class ULDLoss(nn.Module):
                     teacher_row = teacher_row[valid]
                     p = student_row.clamp_min(eps)
                     q = teacher_row.clamp_min(eps)
-                    per_row_losses.append((p * (p.log() - q.log())).sum())
+                    m = (1.0 - beta) * p + beta * q
+                    m = m.clamp_min(eps)
+                    kl_p = (p * (p.log() - m.log())).sum()
+                    kl_q = (q * (q.log() - m.log())).sum()
+                    per_row_losses.append((1.0 - beta) * kl_p + beta * kl_q)
                 if per_row_losses:
                     # Normalize by the number of valid rows to avoid down-weighting sparse alignment.
                     matched_loss = torch.stack(per_row_losses).sum() / max(1, len(per_row_losses))
             else:
                 p = student_matched_probs.clamp_min(eps)
                 q = teacher_matched_probs.clamp_min(eps)
-                matched_loss = (p * (p.log() - q.log())).sum() / max(1, student_aligned.size(0))
+                m = (1.0 - beta) * p + beta * q
+                m = m.clamp_min(eps)
+                kl_p = (p * (p.log() - m.log())).sum()
+                kl_q = (q * (q.log() - m.log())).sum()
+                matched_loss = ((1.0 - beta) * kl_p + beta * kl_q) / max(1, student_aligned.size(0))
 
         # 2. Sorted comparison loss for unmatched vocabulary tokens
         teacher_unmatched_mask = ~teacher_matched_mask
@@ -1827,6 +1837,13 @@ class GOLDTrainer(SFTTrainer):
 
             distillation_loss = torch.stack(distillation_losses).mean()
             loss = self.uld_loss_fn.distillation_weight * distillation_loss
+
+            if self.uld_loss_fn.crossentropy_weight > 0:
+                shift_logits = outputs_student.logits[..., :-1, :].contiguous()
+                shift_labels = student_labels[..., 1:].contiguous()
+                loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
+                ce_loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+                loss = loss + (self.uld_loss_fn.crossentropy_weight * ce_loss)
 
             if matched_losses and unmatched_losses:
                 self.uld_loss_fn.last_matched_loss = torch.stack(matched_losses).mean()
