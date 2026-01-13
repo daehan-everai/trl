@@ -14,6 +14,7 @@
 
 import argparse
 import os
+import random
 import signal
 import subprocess
 import sys
@@ -66,6 +67,7 @@ def wait_for_teacher_vllm(
     vocab_size: int,
     token_id: int,
     timeout_s: float = 30.0,
+    temperature: float | None,
     full_logprobs_format: str,
     full_logprobs_top_p: float | None,
     full_logprobs_max_top_k: int | None,
@@ -78,6 +80,7 @@ def wait_for_teacher_vllm(
             model_name=model_name,
             timeout=5.0,
             max_retries=0,
+            temperature=temperature,
             full_logprobs_format=full_logprobs_format,
             full_logprobs_top_p=full_logprobs_top_p,
             full_logprobs_max_top_k=full_logprobs_max_top_k,
@@ -215,12 +218,27 @@ def resolve_max_length(tokenizer: AutoTokenizer, requested: int | None) -> int:
     return int(max_len)
 
 
+def ensure_assistant_final(example: dict[str, Any]) -> dict[str, Any]:
+    messages = list(example.get("messages") or [])
+    if not messages:
+        return {"messages": []}
+    last_assistant_idx = None
+    for idx in range(len(messages) - 1, -1, -1):
+        if messages[idx].get("role") == "assistant":
+            last_assistant_idx = idx
+            break
+    if last_assistant_idx is None:
+        return {"messages": []}
+    return {"messages": messages[: last_assistant_idx + 1]}
+
+
 def preflight_teacher(
     *,
     base_url: str,
     model_name: str,
     timeout: float,
     max_retries: int,
+    temperature: float | None,
     vocab_size: int,
     token_ids: list[int],
     positions: list[int],
@@ -238,6 +256,7 @@ def preflight_teacher(
             model_name=model_name,
             timeout=timeout,
             max_retries=max_retries,
+            temperature=temperature,
             full_logprobs_format=full_logprobs_format,
             full_logprobs_top_p=full_logprobs_top_p,
             full_logprobs_max_top_k=full_logprobs_max_top_k,
@@ -282,6 +301,12 @@ def main() -> None:
     parser.add_argument("--teacher-timeout", type=float, default=30.0, help="Teacher endpoint timeout (seconds).")
     parser.add_argument("--teacher-max-retries", type=int, default=2, help="Teacher endpoint max retries.")
     parser.add_argument(
+        "--teacher-temperature",
+        type=float,
+        default=1.0,
+        help="Temperature for teacher logprobs (applied server-side by vLLM).",
+    )
+    parser.add_argument(
         "--teacher-full-logprobs-format",
         default="top_p",
         choices=["top_p", "base64_dense"],
@@ -296,7 +321,7 @@ def main() -> None:
     parser.add_argument(
         "--teacher-full-logprobs-max-top-k",
         type=int,
-        default=768,
+        default=2048,
         help="Maximum top-k per position for sparse full_logprobs format.",
     )
     parser.add_argument(
@@ -313,11 +338,37 @@ def main() -> None:
     parser.add_argument("--per-device-train-batch-size", type=int, default=1)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--max-completion-length", type=int, default=64)
+    parser.add_argument(
+        "--filter-max-completion-length",
+        type=int,
+        default=None,
+        help=(
+            "Token budget reserved for completion when filtering prompts. Defaults to --max-completion-length; "
+            "use a larger value (e.g., 512) as a safety margin without changing generation length."
+        ),
+    )
+    parser.add_argument(
+        "--filter-random-slices",
+        action="store_true",
+        help="Randomly slice long conversations to fit the prompt budget instead of dropping them.",
+    )
+    parser.add_argument(
+        "--filter-slice-attempts",
+        type=int,
+        default=8,
+        help="Number of random slice attempts per long conversation when filtering.",
+    )
+    parser.add_argument(
+        "--filter-rng-seed",
+        type=int,
+        default=0,
+        help="Seed used for deterministic random slicing during filtering.",
+    )
     parser.add_argument("--max-length", type=int, default=None)
     parser.add_argument(
         "--student-temperature",
         type=float,
-        default=0.9,
+        default=1.0,
         help="Sampling temperature for student rollouts.",
     )
     parser.add_argument(
@@ -334,6 +385,12 @@ def main() -> None:
     )
     parser.add_argument("--teacher-port", type=int, default=0)
     parser.add_argument("--learning-rate", type=float, default=1e-6)
+    parser.add_argument(
+        "--lmbda",
+        type=float,
+        default=0.9,
+        help="Fraction of on-policy rollouts (1.0 = on-policy only).",
+    )
     parser.add_argument("--min-new-tokens", type=int, default=None, help="Force a minimum number of generated tokens.")
     parser.add_argument(
         "--disable-unmatched-loss",
@@ -428,6 +485,7 @@ def main() -> None:
             vocab_size=len(teacher_tokenizer),
             token_id=int(token_id),
             timeout_s=60.0,
+            temperature=args.teacher_temperature,
             full_logprobs_format=args.teacher_full_logprobs_format,
             full_logprobs_top_p=args.teacher_full_logprobs_top_p,
             full_logprobs_max_top_k=args.teacher_full_logprobs_max_top_k,
@@ -435,17 +493,44 @@ def main() -> None:
 
         dataset = load_dataset(args.dataset_id, split=args.dataset_split)
         dataset = dataset.map(to_messages, remove_columns=dataset.column_names)
+        dataset = dataset.map(ensure_assistant_final)
+        initial_count = len(dataset)
+        dataset = dataset.filter(
+            lambda ex: bool(ex.get("messages"))
+            and ex["messages"][-1].get("role") == "assistant"
+            and any(msg.get("role") == "user" for msg in ex["messages"][:-1])
+        )
+        if len(dataset) < initial_count:
+            print(f"Filtered {initial_count - len(dataset)} samples without assistant completion.")
 
         max_length = resolve_max_length(tokenizer, args.max_length)
         if max_length <= 1:
             raise ValueError("max_length must be > 1 to leave room for generation.")
         max_completion_length = min(int(args.max_completion_length), max_length - 1)
-        max_prompt_tokens = max_length - max_completion_length
+        filter_completion_length = args.filter_max_completion_length
+        if filter_completion_length is None:
+            filter_completion_length = max_completion_length
+        else:
+            filter_completion_length = int(filter_completion_length)
+            if filter_completion_length <= 0:
+                raise ValueError("filter_max_completion_length must be > 0.")
+            if filter_completion_length >= max_length:
+                raise ValueError("filter_max_completion_length must be < max_length.")
+        max_prompt_tokens = max_length - filter_completion_length
         if max_prompt_tokens <= 0:
-            raise ValueError("max_completion_length is too large for max_length.")
+            raise ValueError("filter_max_completion_length is too large for max_length.")
 
-        def keep_example(example: dict[str, Any]) -> bool:
-            prompt_messages = example["messages"][:-1]
+        def build_prompt_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            if not messages:
+                return []
+            if messages[-1].get("role") == "user":
+                return messages
+            return messages[:-1]
+
+        def prompt_length(messages: list[dict[str, Any]]) -> int:
+            prompt_messages = build_prompt_messages(messages)
+            if not prompt_messages:
+                return 0
             formatted_prompt = tokenizer.apply_chat_template(
                 prompt_messages, tokenize=False, add_generation_prompt=True
             )
@@ -456,8 +541,54 @@ def main() -> None:
                 padding=False,
                 return_tensors=None,
             )["input_ids"]
-            return len(prompt_ids) <= max_prompt_tokens
+            return len(prompt_ids)
 
+        def maybe_slice_messages(example: dict[str, Any], index: int) -> dict[str, Any]:
+            if not args.filter_random_slices:
+                return example
+            messages = example.get("messages") or []
+            if not messages:
+                return example
+            if prompt_length(messages) <= max_prompt_tokens:
+                return example
+
+            target_role = messages[-1].get("role")
+            candidate_ends = [i for i, msg in enumerate(messages) if msg.get("role") == target_role]
+            if not candidate_ends:
+                return example
+
+            rng_seed = int(args.filter_rng_seed) if args.filter_rng_seed is not None else None
+            rng = random.Random(rng_seed + int(index)) if rng_seed is not None else random.Random()
+            min_messages = 2 if target_role == "assistant" else 1
+
+            attempts = max(1, int(args.filter_slice_attempts))
+            for _ in range(attempts):
+                end_idx = rng.choice(candidate_ends)
+                start_idx = rng.randint(0, end_idx)
+                sliced = messages[start_idx : end_idx + 1]
+                if len(sliced) < min_messages:
+                    continue
+                if prompt_length(sliced) <= max_prompt_tokens:
+                    return {"messages": sliced}
+
+            end_idx = candidate_ends[-1]
+            for start_idx in range(0, end_idx + 1):
+                sliced = messages[start_idx : end_idx + 1]
+                if len(sliced) < min_messages:
+                    continue
+                if prompt_length(sliced) <= max_prompt_tokens:
+                    return {"messages": sliced}
+
+            return example
+
+        def keep_example(example: dict[str, Any]) -> bool:
+            messages = example.get("messages") or []
+            if not messages:
+                return False
+            return prompt_length(messages) <= max_prompt_tokens
+
+        if args.filter_random_slices:
+            dataset = dataset.map(maybe_slice_messages, with_indices=True)
         dataset = dataset.filter(keep_example)
         if len(dataset) == 0:
             raise ValueError("Filtered dataset is empty. Increase max_length or reduce max_completion_length.")
@@ -482,6 +613,7 @@ def main() -> None:
                 model_name=teacher_model_name,
                 timeout=args.teacher_timeout,
                 max_retries=args.teacher_max_retries,
+                temperature=args.teacher_temperature,
                 vocab_size=len(teacher_tokenizer),
                 token_ids=teacher_ids,
                 positions=[last_pos],
@@ -528,7 +660,7 @@ def main() -> None:
             temperature=args.student_temperature,
             top_p=args.student_top_p,
             top_k=args.student_top_k,
-            lmbda=1.0,
+            lmbda=args.lmbda,
             use_external_teacher_vllm=True,
             teacher_vllm_base_url=teacher_url,
             teacher_vllm_model_name=teacher_model_name,
@@ -540,6 +672,7 @@ def main() -> None:
             teacher_vllm_full_logprobs_max_top_k=args.teacher_full_logprobs_max_top_k,
             teacher_vllm_fail_on_error=True,
             teacher_tokenizer_name_or_path=args.teacher_tokenizer,
+            uld_teacher_temperature=args.teacher_temperature,
             use_vllm=args.use_vllm,
             vllm_mode=args.vllm_mode,
             vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,

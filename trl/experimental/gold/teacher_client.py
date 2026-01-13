@@ -62,6 +62,7 @@ class VLLMTeacherClientConfig:
     model_name: str
     timeout: float = 10.0
     max_retries: int = 3
+    temperature: float | None = None
     full_logprobs_format: str = "top_p"
     full_logprobs_top_p: float | None = 0.9999
     full_logprobs_max_top_k: int | None = 512
@@ -83,6 +84,8 @@ class VLLMTeacherClient:
             raise ValueError("`timeout` must be > 0.")
         if config.max_retries < 0:
             raise ValueError("`max_retries` must be >= 0.")
+        if config.temperature is not None and config.temperature <= 0:
+            raise ValueError("`temperature` must be > 0.")
         if config.full_logprobs_format not in {"base64_dense", "top_p"}:
             raise ValueError("`full_logprobs_format` must be 'base64_dense' or 'top_p'.")
         if config.full_logprobs_format == "top_p" and config.full_logprobs_top_p is not None:
@@ -106,7 +109,7 @@ class VLLMTeacherClient:
                 full_logprobs["top_p"] = self.config.full_logprobs_top_p
             if self.config.full_logprobs_max_top_k is not None:
                 full_logprobs["max_top_k"] = self.config.full_logprobs_max_top_k
-        return {
+        payload = {
             "model": self.config.model_name,
             "prompt": token_ids,
             "max_tokens": 0,
@@ -114,6 +117,9 @@ class VLLMTeacherClient:
             "n": 1,
             "full_logprobs": full_logprobs,
         }
+        if self.config.temperature is not None:
+            payload["temperature"] = float(self.config.temperature)
+        return payload
 
     def fetch_full_logprobs(
         self,
@@ -200,10 +206,35 @@ class VLLMTeacherClient:
         rows = []
         for ids, lps in zip(token_ids, logprobs):
             row = torch.full((int(vocab_size),), float("-inf"), dtype=dtype)
+            valid_ids: set[int] = set()
+            sum_probs = 0.0
             for token_id, logp in zip(ids, lps):
                 token_id = int(token_id)
-                if 0 <= token_id < vocab_size:
-                    row[token_id] = float(logp)
+                if not (0 <= token_id < vocab_size):
+                    continue
+                if token_id in valid_ids:
+                    continue
+                valid_ids.add(token_id)
+                logp_val = float(logp)
+                row[token_id] = logp_val
+                if math.isfinite(logp_val):
+                    try:
+                        sum_probs += math.exp(logp_val)
+                    except OverflowError:
+                        sum_probs = float("inf")
+                        break
+            missing = int(vocab_size) - len(valid_ids)
+            if missing > 0:
+                if not math.isfinite(sum_probs) or sum_probs < 0.0:
+                    sum_probs = 0.0
+                if sum_probs > 1.0:
+                    sum_probs = 1.0
+                tail_mass = 1.0 - sum_probs
+                if tail_mass > 0.0:
+                    tail_prob = tail_mass / missing
+                    if tail_prob > 0.0:
+                        tail_logp = math.log(tail_prob)
+                        row[torch.isneginf(row)] = tail_logp
             rows.append(row)
         return torch.stack(rows, dim=0)
 

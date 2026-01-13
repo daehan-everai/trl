@@ -28,14 +28,17 @@ print(output["generated_text"])
 
 ## Training procedure
 
-[<img src="https://raw.githubusercontent.com/wandb/assets/main/wandb-github-badge-28.svg" alt="Visualize in Weights & Biases" width="150" height="24"/>](https://wandb.ai/lucas01/trl-gold-external-teacher/runs/fywxlj04) 
+[<img src="https://raw.githubusercontent.com/wandb/assets/main/wandb-github-badge-28.svg" alt="Visualize in Weights & Biases" width="150" height="24"/>](https://wandb.ai/lucas01/trl-gold-external-teacher/runs/asiqlxrf) 
 
-### Status (2026-01-11)
+### Status (2026-01-12)
 
-- Active run log: `runs/gold-external-teacher/full_epoch_patch_v7.log` (W&B run `valiant-thunder-34`, id `fywxlj04`).
-- Teacher sparse logprobs: `top_p=0.9999`, `max_top_k=2048`.
-- Student rollout sampling: `temperature=0.7`, `top_p=0.9`, `top_k=50`.
+- Active run log: `runs/gold-external-teacher/full_epoch_patch_v16.log` (W&B run `full_epoch_patch_v16`, id `asiqlxrf`).
+- Teacher sparse logprobs: `top_p=0.9999`, `max_top_k=1024`.
+- Student rollout sampling: `temperature=1.0`, `top_p=0.95`, `top_k=0`.
+- Max lengths: `max_length=4096`, `max_completion_length=256`, `filter_max_completion_length=512`, `teacher_max_input_tokens=4095`.
+- LoRA enabled: `r=32`.
 - Unmatched loss: disabled (`--disable-unmatched-loss`) for matched-only distillation.
+- Hybrid ULD: guard all-`-inf` alignment groups; normalize sparse-row losses by valid-row count.
 
 ### Key changes (so far)
 
@@ -43,6 +46,9 @@ print(output["generated_text"])
 - Always append ChatML generation suffix if truncation dropped it.
 - Stop sequences include space-prefixed variants and both stop criteria run during generation.
 - Hybrid ULD unmatched loss now ignores sparse teacher tail (zero-prob) instead of forcing student to zero.
+- Hybrid ULD sparse-row losses normalized by valid-row count (instead of full sequence length).
+- Alignment merging guards all-`-inf` groups to avoid NaNs in log-softmax.
+- Prompt filtering now supports a separate `--filter-max-completion-length` safety budget.
 - Added CLI args for student rollout sampling: `--student-temperature`, `--student-top-p`, `--student-top-k`.
 
 ### Trial and error notes
@@ -51,6 +57,7 @@ print(output["generated_text"])
 - `runs/gold-external-teacher/full_epoch_patch_v4.log` and `runs/gold-external-teacher/full_epoch_patch_v5.log`: aborted due to missing CLI args for student sampling.
 - `runs/gold-external-teacher/full_epoch_patch_v6.log`: unmatched loss masked sparse tail, but late-step degeneration persisted (around steps 36-40) with repetitive "Avec ..." output.
 - `runs/gold-external-teacher/full_epoch_patch_v7.log`: unmatched loss disabled; mid-epoch looked healthy (steps ~19-23), but late steps (87-91) collapsed to repeated "avec" token.
+- `runs/gold-external-teacher/full_epoch_patch_v12.log`: run crashed at step 26 with NaNs during on-policy sampling.
 - `runs/gold-external-teacher/debug_patch_run_len2048_mc256_steps2_v3.log`: no ChatML tag leakage in completions after stop/prompt fixes.
 - `runs/gold-external-teacher/metrics_plot.png`: partial metrics plot from earlier run.
 

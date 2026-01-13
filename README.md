@@ -9,13 +9,14 @@ Run GOLD external-teacher training against a vLLM teacher endpoint and log rollo
   - `WANDB_API_KEY`
   - Optional defaults: `STUDENT_MODEL_ID`, `TEACHER_VLLM_MODEL_NAME`
 - Python deps are installed:
-  - External-teacher run (LoRA + W&B): `pip install -e '.[peft]' wandb`
+  - External-teacher run (LoRA + W&B): `pip install -e '.[peft]' wandb rich`
   - Local dummy-teacher run (optional): `pip install fastapi uvicorn`
 - Teacher endpoint is reachable and supports `full_logprobs` with `format="top_p"` (avoid `base64_dense` to reduce ngrok payload cost).
 - Local caches should live under `/workspace` to avoid root disk space issues.
 
 ## Dataset fix and push (if needed)
-If the dataset needs to end on a user turn and drop `prompt`:
+Only use this if you want on-policy-only runs (`--lmbda 1.0`). Any off-policy loss (`--lmbda < 1.0`) requires the
+dataset to end on an assistant turn so the last assistant message is used as the completion:
 ```bash
 python scripts/fix_french_conversations_dataset.py --repo-id EverAI-AI/french-conversations-prompt --split train
 ```
@@ -40,9 +41,9 @@ nohup env HF_HOME=/workspace/.cache/huggingface \
   --model-id EverAI-AI/MagistSmall-Raven-ALT-2 \
   --dataset-id EverAI-AI/french-conversations-prompt \
   --dataset-split train \
-  --teacher-tokenizer microsoft/Phi-3.5-mini-instruct \
+  --teacher-tokenizer deepseek-ai/DeepSeek-R1-0528-Qwen3-8B \
   --teacher-url https://spasmodically-untimeous-marlene.ngrok-free.dev/v1/completions \
-  --teacher-model-name microsoft/Phi-3.5-mini-instruct \
+  --teacher-model-name deepseek-ai/DeepSeek-R1-0528-Qwen3-8B \
   --teacher-full-logprobs-format top_p \
   --teacher-full-logprobs-top-p 0.9999 \
   --teacher-full-logprobs-max-top-k 1024 \
@@ -50,7 +51,7 @@ nohup env HF_HOME=/workspace/.cache/huggingface \
   --teacher-max-retries 1 \
   --max-length 2048 \
   --max-completion-length 256 \
-  --teacher-max-input-tokens 4095 \
+  --teacher-max-input-tokens 2950 \
   --use-lora \
   --lora-r 32 \
   --learning-rate 1e-5 \
@@ -60,13 +61,17 @@ nohup env HF_HOME=/workspace/.cache/huggingface \
   --log-rollouts \
   --log-rollouts-steps 1 \
   --rollouts-per-log 3 \
+  --lmbda 0.9 \
+  --disable-unmatched-loss \
   > runs/gold-external-teacher/teacher_run.log 2>&1 & echo $!
 ```
 
 ## Best practices
 - Start with a short sanity run (`--max-steps 1` or small split) before a full epoch.
 - Keep rollouts logging at `--log-rollouts-steps 1` until outputs look sane, then increase.
-- Make sure the dataset ends on a user turn so the model actually generates an assistant reply.
+- For on-policy-only runs (`--lmbda 1.0`), the dataset should end on a user turn.
+- For any off-policy loss (`--lmbda < 1.0`), the dataset must end on an assistant turn and include at least one user turn.
+- When `0 < --lmbda < 1`, on-policy and off-policy losses are computed every batch and combined as a weighted sum.
 - Keep `--max-length` and `--teacher-max-input-tokens` within the teacher’s context window.
 - Always verify W&B completions end at the stop marker and do **not** include a new user turn.
 
@@ -97,6 +102,9 @@ env HF_HOME=/workspace/.cache/huggingface \
 ## Monitoring
 - Log file: `runs/gold-external-teacher/teacher_run.log`
 - W&B: use the run URL printed in the log.
+- Confirm off-policy is active by checking `off_policy_loss` and `off_policy_fraction` (should be `1 - lmbda`).
+- Confirm completions are valid by checking `num_valid_completion_tokens` stays > 0.
+- W&B tables: `completions` (on-policy) and `off_policy_completions` (dataset completions).
 - Check for teacher request errors:
 ```bash
 rg -n "Teacher endpoint error|prompt_len|positions_min|positions_max" runs/gold-external-teacher/teacher_run.log
@@ -113,6 +121,8 @@ rg -n "Teacher endpoint error|prompt_len|positions_min|positions_max" runs/gold-
 - Update: `--teacher-tokenizer`, `--teacher-model-name`, and `--teacher-url`.
 - Set `--teacher-max-input-tokens` to the teacher’s real context limit (or slightly under it).
 - Ensure the teacher endpoint supports `full_logprobs` with `format="top_p"`.
+- If using sparse top-p logprobs, increase `--teacher-full-logprobs-max-top-k` to reduce tail-mass approximation.
+- `--teacher-model-name` must match the model actually served by the endpoint (404s mean a mismatch).
 
 ## Notes
 - Run notes (2026-01-09)

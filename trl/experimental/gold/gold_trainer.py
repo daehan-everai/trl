@@ -33,6 +33,7 @@ from accelerate.utils import DistributedType, broadcast_object_list, gather_obje
 from datasets import Dataset, IterableDataset
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from transformers import AutoTokenizer, is_bitsandbytes_available
+from transformers.training_args import OptimizerNames
 from transformers.data.data_collator import DataCollator
 from transformers.feature_extraction_utils import FeatureExtractionMixin
 from transformers.generation.configuration_utils import GenerationConfig
@@ -49,6 +50,7 @@ from transformers.utils import (
     is_liger_kernel_available,
     is_peft_available,
     is_rich_available,
+    is_sagemaker_mp_enabled,
 )
 
 from ...data_utils import is_conversational, maybe_convert_to_chatml, pack_dataset, truncate_dataset
@@ -486,9 +488,9 @@ class ULDLoss(nn.Module):
             student_answer_logits = student_logits[i, student_start - 1 : student_start - 1 + student_size]
             teacher_answer_logits = teacher_logits[i, teacher_start - 1 : teacher_start - 1 + teacher_size]
 
-            # Convert to probabilities
-            student_probs = F.softmax(student_answer_logits / self.student_temperature, dim=-1)
-            teacher_probs = F.softmax(teacher_answer_logits / self.teacher_temperature, dim=-1)
+            # Convert to log-probabilities for alignment in log space
+            student_log_probs = F.log_softmax(student_answer_logits / self.student_temperature, dim=-1)
+            teacher_log_probs = F.log_softmax(teacher_answer_logits / self.teacher_temperature, dim=-1)
 
             # Get token IDs for mapping (always use actual input_ids)
             student_token_ids = student_input_ids[i, student_start : student_start + student_size].tolist()
@@ -501,18 +503,21 @@ class ULDLoss(nn.Module):
                 )
 
                 # Merge student probabilities using student alignment groups
-                student_aligned = self._merge_probabilities_with_alignment_groups(
-                    student_probs, student_alignment_groups
+                student_log_aligned = self._merge_log_probs_with_alignment_groups(
+                    student_log_probs, student_alignment_groups
                 )
 
-                # Merge teacher probabilities using teacher alignment groups
-                teacher_aligned = self._merge_probabilities_with_alignment_groups(
-                    teacher_probs, teacher_alignment_groups
+                # Merge teacher log-probabilities using teacher alignment groups
+                teacher_log_aligned = self._merge_log_probs_with_alignment_groups(
+                    teacher_log_probs, teacher_alignment_groups
                 )
             else:
                 min_length = min(len(student_token_ids), len(teacher_token_ids))
-                student_aligned = student_probs[:min_length, :]
-                teacher_aligned = teacher_probs[:min_length, :]
+                student_log_aligned = student_log_probs[:min_length, :]
+                teacher_log_aligned = teacher_log_probs[:min_length, :]
+
+            student_aligned = student_log_aligned.exp()
+            teacher_aligned = teacher_log_aligned.exp()
 
             # Apply ULD loss computation
             if self.use_hybrid_loss and self._vocab_mapping is not None:
@@ -675,6 +680,66 @@ class ULDLoss(nn.Module):
 
         return aligned_probs
 
+    def _merge_log_probs_with_alignment_groups(self, log_probs, alignment_groups):
+        """
+        Merge log-probabilities based on alignment groups.
+
+        Args:
+            log_probs: Log-probability tensor [seq_len, vocab_size]
+            alignment_groups: List of alignment groups (each group is a list of positions to merge)
+
+        Returns:
+            Merged log-probability tensor [num_groups, vocab_size]
+        """
+        if not alignment_groups:
+            return log_probs
+
+        vocab_size = log_probs.size(-1)
+        target_len = len(alignment_groups)
+        aligned_log_probs = torch.full(
+            (target_len, vocab_size),
+            float("-inf"),
+            device=log_probs.device,
+            dtype=log_probs.dtype,
+        )
+
+        for group_idx, group in enumerate(alignment_groups):
+            if len(group) > 1:
+                logp = log_probs[group[0]].clone()
+                for idx in group[1:]:
+                    if idx < log_probs.size(0):
+                        logp = logp + log_probs[idx]
+                # Guard against all -inf rows (e.g., sparse teacher intersection), which yield NaNs in log_softmax.
+                if not torch.isfinite(logp).any():
+                    aligned_log_probs[group_idx] = torch.full(
+                        (vocab_size,),
+                        float("-inf"),
+                        device=log_probs.device,
+                        dtype=log_probs.dtype,
+                    )
+                else:
+                    aligned_log_probs[group_idx] = torch.log_softmax(logp, dim=-1)
+            elif len(group) == 1:
+                row = log_probs[group[0]]
+                if not torch.isfinite(row).any():
+                    aligned_log_probs[group_idx] = torch.full(
+                        (vocab_size,),
+                        float("-inf"),
+                        device=log_probs.device,
+                        dtype=log_probs.dtype,
+                    )
+                else:
+                    aligned_log_probs[group_idx] = row
+            else:
+                aligned_log_probs[group_idx] = torch.full(
+                    (vocab_size,),
+                    float("-inf"),
+                    device=log_probs.device,
+                    dtype=log_probs.dtype,
+                )
+
+        return aligned_log_probs
+
     def _compute_hybrid_uld_loss(self, student_aligned, teacher_aligned):
         """
         Compute hybrid ULD loss on aligned probability distributions. This method:
@@ -720,9 +785,25 @@ class ULDLoss(nn.Module):
             matched_token_count = teacher_matched_probs.size(-1)
 
             eps = 1e-8
-            p = student_matched_probs.clamp_min(eps)
-            q = teacher_matched_probs.clamp_min(eps)
-            matched_loss = (p * (p.log() - q.log())).sum() / max(1, student_aligned.size(0))
+            if (teacher_matched_probs == 0).any():
+                per_row_losses = []
+                for row in range(teacher_matched_probs.size(0)):
+                    teacher_row = teacher_matched_probs[row]
+                    valid = teacher_row > 0
+                    if not valid.any():
+                        continue
+                    student_row = student_matched_probs[row][valid]
+                    teacher_row = teacher_row[valid]
+                    p = student_row.clamp_min(eps)
+                    q = teacher_row.clamp_min(eps)
+                    per_row_losses.append((p * (p.log() - q.log())).sum())
+                if per_row_losses:
+                    # Normalize by the number of valid rows to avoid down-weighting sparse alignment.
+                    matched_loss = torch.stack(per_row_losses).sum() / max(1, len(per_row_losses))
+            else:
+                p = student_matched_probs.clamp_min(eps)
+                q = teacher_matched_probs.clamp_min(eps)
+                matched_loss = (p * (p.log() - q.log())).sum() / max(1, student_aligned.size(0))
 
         # 2. Sorted comparison loss for unmatched vocabulary tokens
         teacher_unmatched_mask = ~teacher_matched_mask
@@ -761,7 +842,8 @@ class ULDLoss(nn.Module):
                         F.l1_loss(student_sorted[:min_len], teacher_sorted[:min_len], reduction="sum")
                     )
                 if per_row_losses:
-                    unmatched_loss = torch.stack(per_row_losses).sum() / max(1, student_aligned.size(0))
+                    # Normalize by the number of valid rows to avoid down-weighting sparse alignment.
+                    unmatched_loss = torch.stack(per_row_losses).sum() / max(1, len(per_row_losses))
             else:
                 # Dense teacher distribution: use original sorted L1 on unmatched tokens.
                 teacher_unmatched_sorted = teacher_unmatched_probs.sort(dim=-1, descending=True).values
@@ -942,6 +1024,7 @@ class GOLDTrainer(SFTTrainer):
                     model_name=args.teacher_vllm_model_name,
                     timeout=args.teacher_vllm_timeout,
                     max_retries=args.teacher_vllm_max_retries,
+                    temperature=args.uld_teacher_temperature,
                     full_logprobs_format=args.teacher_vllm_full_logprobs_format,
                     full_logprobs_top_p=args.teacher_vllm_full_logprobs_top_p,
                     full_logprobs_max_top_k=args.teacher_vllm_full_logprobs_max_top_k,
@@ -988,6 +1071,8 @@ class GOLDTrainer(SFTTrainer):
         self._off_policy_loss_total = 0.0
         self._on_policy_step_equiv = 0.0
         self._off_policy_step_equiv = 0.0
+        self._valid_completion_tokens_sum = 0.0
+        self._valid_completion_tokens_step_eq = 0.0
 
         # Hybrid ULD matched/unmatched accumulators (logged every step when ULD hybrid is used)
         self._matched_sum = 0.0
@@ -1085,6 +1170,8 @@ class GOLDTrainer(SFTTrainer):
         self._textual_logs = {
             "prompt": deque(maxlen=maxlen),
             "completion": deque(maxlen=maxlen),
+            "off_policy_prompt": deque(maxlen=maxlen),
+            "off_policy_completion": deque(maxlen=maxlen),
             "rewards": defaultdict(lambda: deque(maxlen=maxlen)),
             "advantages": deque(maxlen=maxlen),
         }
@@ -1652,23 +1739,28 @@ class GOLDTrainer(SFTTrainer):
                     student_token_ids = inputs["input_ids"][i, student_start : student_start + student_size].tolist()
                     teacher_token_ids = teacher_input_ids[i, teacher_start : teacher_start + teacher_size].tolist()
 
-                    student_probs = F.softmax(student_answer_logits / self.uld_loss_fn.student_temperature, dim=-1)
-                    teacher_probs = F.softmax(teacher_answer_logits / self.uld_loss_fn.teacher_temperature, dim=-1)
+                    student_log_probs = F.log_softmax(
+                        student_answer_logits / self.uld_loss_fn.student_temperature, dim=-1
+                    )
+                    teacher_log_probs = teacher_answer_logits
 
                     if self.uld_loss_fn.use_extended_uld:
                         student_groups, teacher_groups = self.uld_loss_fn._build_alignment_groups_from_ids(
                             student_token_ids, teacher_token_ids
                         )
-                        student_aligned = self.uld_loss_fn._merge_probabilities_with_alignment_groups(
-                            student_probs, student_groups
+                        student_log_aligned = self.uld_loss_fn._merge_log_probs_with_alignment_groups(
+                            student_log_probs, student_groups
                         )
-                        teacher_aligned = self.uld_loss_fn._merge_probabilities_with_alignment_groups(
-                            teacher_probs, teacher_groups
+                        teacher_log_aligned = self.uld_loss_fn._merge_log_probs_with_alignment_groups(
+                            teacher_log_probs, teacher_groups
                         )
                     else:
                         min_length = min(len(student_token_ids), len(teacher_token_ids))
-                        student_aligned = student_probs[:min_length, :]
-                        teacher_aligned = teacher_probs[:min_length, :]
+                        student_log_aligned = student_log_probs[:min_length, :]
+                        teacher_log_aligned = teacher_log_probs[:min_length, :]
+
+                    student_aligned = student_log_aligned.exp()
+                    teacher_aligned = teacher_log_aligned.exp()
 
                     if self.uld_loss_fn.use_hybrid_loss and self.uld_loss_fn._vocab_mapping is not None:
                         aligned_loss = self.uld_loss_fn._compute_hybrid_uld_loss(student_aligned, teacher_aligned)
@@ -2416,59 +2508,194 @@ class GOLDTrainer(SFTTrainer):
         """
         Perform a training step for the General Online Logit Distillation (GOLD) model.
 
-        This method implements the on-policy learning approach described in the GOLD blog post. With probability
-        `self.lmbda`, it generates new responses using the student model, which are then used for training instead of
-        the offline original inputs.
+        When `0 < self.lmbda < 1`, both on-policy and off-policy losses are computed every batch, and the weighted
+        sum `self.lmbda * on_policy_loss + (1 - self.lmbda) * off_policy_loss` is optimized.
         """
-        on_policy = False
-        if random.random() <= self.lmbda:
-            on_policy = True
-            if self.use_vllm:
-                self._wake_vllm_if_needed()
-                result = self._generate_on_policy_outputs_vllm(
-                    inputs, self.generation_config, self.processing_class.pad_token_id
+        with self.maybe_activation_offload_context:
+            on_policy_weight = float(self.lmbda)
+            off_policy_weight = 1.0 - on_policy_weight
+            mix_on_off = on_policy_weight > 0.0 and off_policy_weight > 0.0
+            on_policy = on_policy_weight > 0.0
+            off_policy = off_policy_weight > 0.0
+
+            if mix_on_off and is_sagemaker_mp_enabled():
+                raise NotImplementedError(
+                    "Mixed on/off-policy loss is not supported with SageMaker model parallelism."
                 )
-                new_input_ids, new_attention_mask, new_labels, prompt_texts, completion_texts = result
-                if self.vllm_mode == "colocate" and self.vllm_enable_sleep_mode:
-                    self.vllm_engine.sleep(level=2)
-            else:
-                with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
-                    result = self.generate_on_policy_outputs(
-                        unwrapped_model, inputs, self.generation_config, self.processing_class.pad_token_id
+
+            prompt_texts = None
+            completion_texts = None
+            if on_policy:
+                if self.use_vllm:
+                    self._wake_vllm_if_needed()
+                    result = self._generate_on_policy_outputs_vllm(
+                        inputs, self.generation_config, self.processing_class.pad_token_id
                     )
                     new_input_ids, new_attention_mask, new_labels, prompt_texts, completion_texts = result
+                    if self.vllm_mode == "colocate" and self.vllm_enable_sleep_mode:
+                        self.vllm_engine.sleep(level=2)
+                else:
+                    with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
+                        result = self.generate_on_policy_outputs(
+                            unwrapped_model, inputs, self.generation_config, self.processing_class.pad_token_id
+                        )
+                        new_input_ids, new_attention_mask, new_labels, prompt_texts, completion_texts = result
 
-            inputs["input_ids"] = new_input_ids
-            inputs["attention_mask"] = new_attention_mask
-            inputs["labels"] = new_labels
+            if mix_on_off:
+                on_policy_inputs = dict(inputs)
+                on_policy_inputs["input_ids"] = new_input_ids
+                on_policy_inputs["attention_mask"] = new_attention_mask
+                on_policy_inputs["labels"] = new_labels
+                # Preserve original text for cross-tokenizer ULD loss.
+                on_policy_inputs["original_prompt_text"] = prompt_texts
+                on_policy_inputs["original_completion_text"] = completion_texts
+                off_policy_inputs = inputs
+            else:
+                on_policy_inputs = None
+                off_policy_inputs = inputs
+                if on_policy:
+                    inputs["input_ids"] = new_input_ids
+                    inputs["attention_mask"] = new_attention_mask
+                    inputs["labels"] = new_labels
+                    # Preserve original text for cross-tokenizer ULD loss.
+                    inputs["original_prompt_text"] = prompt_texts
+                    inputs["original_completion_text"] = completion_texts
 
-            # CRITICAL: Preserve original text for cross-tokenizer ULD loss
-            # This ensures both off-policy (dataset) and on-policy (generated) samples
-            # can use proper text-based alignment for different tokenizers
-            inputs["original_prompt_text"] = prompt_texts
-            inputs["original_completion_text"] = completion_texts
+            off_policy_prompts = None
+            off_policy_completions = None
+            if (
+                off_policy
+                and "original_prompt_text" in off_policy_inputs
+                and "original_completion_text" in off_policy_inputs
+            ):
+                off_policy_prompts = off_policy_inputs["original_prompt_text"]
+                off_policy_completions = off_policy_inputs["original_completion_text"]
 
-            # Log prompt and completion texts
-            gathered_prompts = gather_object(prompt_texts)
-            gathered_completions = gather_object(completion_texts)
-            self._textual_logs["prompt"].extend(gathered_prompts)
-            self._textual_logs["completion"].extend(gathered_completions)
+            if self.log_completions:
+                gathered_on_prompts = None
+                gathered_on_completions = None
+                gathered_off_prompts = None
+                gathered_off_completions = None
 
-        loss = super().training_step(model, inputs, num_items_in_batch)
+                if prompt_texts is not None and completion_texts is not None:
+                    gathered_on_prompts = gather_object(prompt_texts)
+                    gathered_on_completions = gather_object(completion_texts)
+                    self._textual_logs["prompt"].extend(gathered_on_prompts)
+                    self._textual_logs["completion"].extend(gathered_on_completions)
 
-        loss_scalar = float(loss.detach())
-        ga = max(1, int(self.args.gradient_accumulation_steps))
-        step_equiv = 1.0 / ga
+                if off_policy_prompts is not None and off_policy_completions is not None:
+                    gathered_off_prompts = gather_object(off_policy_prompts)
+                    gathered_off_completions = gather_object(off_policy_completions)
+                    if gathered_on_prompts is None:
+                        self._textual_logs["prompt"].extend(gathered_off_prompts)
+                        self._textual_logs["completion"].extend(gathered_off_completions)
+                    self._textual_logs["off_policy_prompt"].extend(gathered_off_prompts)
+                    self._textual_logs["off_policy_completion"].extend(gathered_off_completions)
 
-        if on_policy:
-            self._on_policy_loss_total += loss_scalar
+            valid_completion_tokens = None
+            labels_for_count = None
+            if on_policy and "labels" in (on_policy_inputs or inputs):
+                labels_for_count = (on_policy_inputs or inputs)["labels"]
+            elif off_policy and "labels" in off_policy_inputs:
+                labels_for_count = off_policy_inputs["labels"]
+            if labels_for_count is not None:
+                if hasattr(self.processing_class, "pad_token_id") and self.processing_class.pad_token_id is not None:
+                    valid_mask = (labels_for_count != -100) & (
+                        labels_for_count != self.processing_class.pad_token_id
+                    )
+                else:
+                    valid_mask = labels_for_count != -100
+                valid_completion_tokens = float(valid_mask.sum().item())
+
+            if not mix_on_off:
+                loss = super().training_step(model, inputs, num_items_in_batch)
+
+                loss_scalar = float(loss.detach())
+                ga_steps = max(
+                    1, int(getattr(self, "current_gradient_accumulation_steps", self.args.gradient_accumulation_steps))
+                )
+                step_equiv = 1.0 / ga_steps
+
+                if on_policy:
+                    self._on_policy_loss_total += loss_scalar
+                    self._on_policy_step_equiv += step_equiv
+                else:
+                    self._off_policy_loss_total += loss_scalar
+                    self._off_policy_step_equiv += step_equiv
+                if valid_completion_tokens is not None:
+                    self._valid_completion_tokens_sum += valid_completion_tokens
+                    self._valid_completion_tokens_step_eq += step_equiv
+                return loss
+
+            # Mixed on/off-policy loss path.
+            on_policy_loss = None
+            off_policy_loss = None
+
+            on_cp_context, on_policy_inputs = self._prepare_context_parallel_inputs(model, on_policy_inputs)
+            off_cp_context, off_policy_inputs = self._prepare_context_parallel_inputs(model, off_policy_inputs)
+
+            model.train()
+            if hasattr(self.optimizer, "train") and callable(self.optimizer.train):
+                self.optimizer.train()
+
+            with self.compute_loss_context_manager():
+                with on_cp_context():
+                    on_policy_inputs = self._prepare_inputs(on_policy_inputs)
+                    on_policy_loss = self.compute_loss(model, on_policy_inputs, num_items_in_batch=num_items_in_batch)
+                with off_cp_context():
+                    off_policy_inputs = self._prepare_inputs(off_policy_inputs)
+                    off_policy_loss = self.compute_loss(model, off_policy_inputs, num_items_in_batch=num_items_in_batch)
+
+            del on_policy_inputs, off_policy_inputs
+            if (
+                self.args.torch_empty_cache_steps is not None
+                and self.state.global_step % self.args.torch_empty_cache_steps == 0
+            ):
+                empty_cache()
+
+            kwargs = {}
+            if self.args.optim in [OptimizerNames.LOMO, OptimizerNames.ADALOMO]:
+                kwargs["learning_rate"] = self._get_learning_rate()
+
+            if self.args.n_gpu > 1:
+                on_policy_loss = on_policy_loss.mean()
+                off_policy_loss = off_policy_loss.mean()
+
+            total_loss = (on_policy_weight * on_policy_loss) + (off_policy_weight * off_policy_loss)
+
+            ga_steps = max(
+                1, int(getattr(self, "current_gradient_accumulation_steps", self.args.gradient_accumulation_steps))
+            )
+            loss_scale = 1.0
+            if self.use_apex:
+                from apex import amp
+
+                with amp.scale_loss(total_loss, self.optimizer) as scaled_loss:
+                    scaled_loss.backward()
+            else:
+                if (
+                    not self.model_accepts_loss_kwargs or num_items_in_batch is None
+                ) and self.compute_loss_func is None:
+                    loss_scale = 1.0 / ga_steps
+                    total_loss = total_loss * loss_scale
+                if self.accelerator.distributed_type == DistributedType.DEEPSPEED:
+                    kwargs["scale_wrt_gas"] = False
+                self.accelerator.backward(total_loss, **kwargs)
+
+            step_equiv = 1.0 / ga_steps
+            self._on_policy_loss_total += float(on_policy_loss.detach()) * loss_scale
             self._on_policy_step_equiv += step_equiv
-        else:
-            self._off_policy_loss_total += loss_scalar
+            self._off_policy_loss_total += float(off_policy_loss.detach()) * loss_scale
             self._off_policy_step_equiv += step_equiv
-        return loss
+            if valid_completion_tokens is not None:
+                self._valid_completion_tokens_sum += valid_completion_tokens
+                self._valid_completion_tokens_step_eq += step_equiv
 
-    def _log_completion_table_step(self, prompts: list[str], completions: list[str]) -> None:
+            return total_loss.detach()
+
+    def _log_completion_table_step(
+        self, prompts: list[str], completions: list[str], table_name: str = "completions"
+    ) -> None:
         if not (
             self.accelerator.is_main_process
             and self.log_completions
@@ -2500,7 +2727,7 @@ class GOLDTrainer(SFTTrainer):
 
         data = [[int(self.state.global_step), prompts[i], completions[i]] for i in indices]
         table = wandb.Table(columns=["global_step", "prompt", "completion"], data=data)
-        wandb.log({"completions": table})
+        wandb.log({table_name: table})
 
     def log(self, logs: dict[str, float], start_time: float | None = None) -> None:
         mode = "train" if self.model.training else "eval"
@@ -2519,6 +2746,8 @@ class GOLDTrainer(SFTTrainer):
                     self._unmatched_sum,
                     self._matched_step_eq,
                     self._unmatched_step_eq,
+                    self._valid_completion_tokens_sum,
+                    self._valid_completion_tokens_step_eq,
                 ],
                 dtype=torch.float64,
                 device=device,
@@ -2541,6 +2770,8 @@ class GOLDTrainer(SFTTrainer):
                 unmatched_sum,
                 matched_eq,
                 unmatched_eq,
+                valid_sum,
+                valid_eq,
             ) = vec.tolist()
 
             # Compute category averages over the *same window* as Trainer's logs
@@ -2549,18 +2780,30 @@ class GOLDTrainer(SFTTrainer):
                 logs["on_policy_loss"] = round(on_sum / on_eq, 4)
             if off_eq > 0:
                 logs["off_policy_loss"] = round(off_sum / off_eq, 4)
+            logs["on_policy_steps"] = round(on_eq, 4)
+            logs["off_policy_steps"] = round(off_eq, 4)
+            total_eq = on_eq + off_eq
+            if total_eq > 0:
+                if on_eq > 0 and off_eq > 0 and 0.0 < self.lmbda < 1.0:
+                    logs["off_policy_fraction"] = round(1.0 - self.lmbda, 4)
+                else:
+                    logs["off_policy_fraction"] = round(off_eq / total_eq, 4)
 
             # matched/unmatched averaged over same logging window (if present)
             if matched_eq > 0:
                 logs["matched_loss"] = round(matched_sum / matched_eq, 4)
             if unmatched_eq > 0:
                 logs["unmatched_loss"] = round(unmatched_sum / unmatched_eq, 4)
+            if valid_eq > 0:
+                logs["num_valid_completion_tokens"] = round(valid_sum / valid_eq, 4)
 
             # Reset window accumulators after logging (just like Trainer resets its window)
             self._on_policy_loss_total = self._off_policy_loss_total = 0.0
             self._on_policy_step_equiv = self._off_policy_step_equiv = 0.0
             self._matched_sum = self._unmatched_sum = 0.0
             self._matched_step_eq = self._unmatched_step_eq = 0.0
+            self._valid_completion_tokens_sum = 0.0
+            self._valid_completion_tokens_step_eq = 0.0
 
         # This method can be called both in training and evaluation. When called in evaluation, the keys in `logs`
         # start with "eval_". We need to add the prefix "eval_" to the keys in `metrics` to match the format.
@@ -2588,3 +2831,10 @@ class GOLDTrainer(SFTTrainer):
                 list(self._textual_logs["prompt"]),
                 list(self._textual_logs["completion"]),
             )
+            self._log_completion_table_step(
+                list(self._textual_logs["off_policy_prompt"]),
+                list(self._textual_logs["off_policy_completion"]),
+                table_name="off_policy_completions",
+            )
+            self._textual_logs["off_policy_prompt"].clear()
+            self._textual_logs["off_policy_completion"].clear()

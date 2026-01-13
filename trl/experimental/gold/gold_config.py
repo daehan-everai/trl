@@ -31,11 +31,11 @@ class GOLDConfig(SFTConfig):
     please refer to the [`~transformers.TrainingArguments`] and [`SFTConfig`] documentation.
 
     Args:
-        temperature (`float`, *optional*, defaults to `0.9`):
+        temperature (`float`, *optional*, defaults to `1.0`):
             Temperature for sampling. The higher the temperature, the more random the completions.
         lmbda (`float`, *optional*, defaults to `0.5`):
-            Lambda parameter that controls the student data fraction (i.e., the proportion of on-policy
-            student-generated outputs).
+            Weight for the on-policy loss. When `0 < lmbda < 1`, both on-policy and off-policy losses are computed
+            each batch and combined as `lmbda * on_policy_loss + (1 - lmbda) * off_policy_loss`.
         beta (`float`, *optional*, defaults to `0.5`):
             Interpolation coefficient between `0.0` and `1.0` of the Generalized Jensen-Shannon Divergence loss. When
             beta is `0.0`, the loss is the KL divergence. When beta is `1.0`, the loss is the Inverse KL Divergence.
@@ -121,7 +121,7 @@ class GOLDConfig(SFTConfig):
 
     # GOLD-specific parameters
     temperature: float = field(
-        default=0.9,
+        default=1.0,
         metadata={"help": "Temperature for sampling. The higher the temperature, the more random the completions."},
     )
     top_p: float = field(
@@ -138,8 +138,8 @@ class GOLDConfig(SFTConfig):
     lmbda: float = field(
         default=0.5,
         metadata={
-            "help": "Lambda parameter that controls the student data fraction (i.e., the proportion of on-policy "
-            "student-generated outputs)."
+            "help": "Weight for the on-policy loss. When `0 < lmbda < 1`, both on-policy and off-policy losses are "
+            "computed each batch and combined as `lmbda * on_policy_loss + (1 - lmbda) * off_policy_loss`."
         },
     )
     beta: float = field(
@@ -464,11 +464,11 @@ class GOLDConfig(SFTConfig):
                 )
                 self.uld_use_hybrid_loss = True
 
-            if self.lmbda != 1.0:
+            if self.lmbda < 1.0:
                 self.logger.warning(
-                    "`use_external_teacher_vllm=True` requires on-policy-only distillation; forcing `lmbda=1.0`."
+                    "`use_external_teacher_vllm=True` with `lmbda<1` mixes off-policy data; ensure the dataset ends "
+                    "with an assistant completion for those steps."
                 )
-                self.lmbda = 1.0
 
             if self.uld_crossentropy_weight != 0.0:
                 self.logger.warning(
