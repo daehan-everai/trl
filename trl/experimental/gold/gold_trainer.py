@@ -1617,7 +1617,35 @@ class GOLDTrainer(SFTTrainer):
         else:
             return jsd
 
+    def _compute_off_policy_ce_loss(self, model, inputs, return_outputs=False):
+        labels = inputs.get("labels")
+        if labels is None:
+            raise ValueError("Off-policy CE loss requires `labels` in inputs.")
+
+        if hasattr(self.processing_class, "pad_token_id") and self.processing_class.pad_token_id is not None:
+            labels = labels.clone()
+            labels[labels == self.processing_class.pad_token_id] = -100
+
+        model_inputs: dict[str, Any] = {"labels": labels, "use_cache": False}
+        if "inputs_embeds" in inputs and inputs["inputs_embeds"] is not None:
+            model_inputs["inputs_embeds"] = inputs["inputs_embeds"]
+        else:
+            model_inputs["input_ids"] = inputs["input_ids"]
+        if "attention_mask" in inputs:
+            model_inputs["attention_mask"] = inputs["attention_mask"]
+        if "position_ids" in inputs:
+            model_inputs["position_ids"] = inputs["position_ids"]
+        if "token_type_ids" in inputs:
+            model_inputs["token_type_ids"] = inputs["token_type_ids"]
+
+        outputs = model(**model_inputs)
+        loss = outputs.loss if hasattr(outputs, "loss") else outputs[0]
+        return (loss, outputs) if return_outputs else loss
+
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        if inputs.get("use_off_policy_ce", False):
+            return self._compute_off_policy_ce_loss(model, inputs, return_outputs=return_outputs)
+
         if self.use_external_teacher_vllm:
             if self.teacher_tokenizer is None or self.teacher_client is None or self.uld_loss_fn is None:
                 raise ValueError(
@@ -2549,7 +2577,8 @@ class GOLDTrainer(SFTTrainer):
                 # Preserve original text for cross-tokenizer ULD loss.
                 on_policy_inputs["original_prompt_text"] = prompt_texts
                 on_policy_inputs["original_completion_text"] = completion_texts
-                off_policy_inputs = inputs
+                off_policy_inputs = dict(inputs)
+                off_policy_inputs["use_off_policy_ce"] = True
             else:
                 on_policy_inputs = None
                 off_policy_inputs = inputs
@@ -2560,6 +2589,8 @@ class GOLDTrainer(SFTTrainer):
                     # Preserve original text for cross-tokenizer ULD loss.
                     inputs["original_prompt_text"] = prompt_texts
                     inputs["original_completion_text"] = completion_texts
+                if off_policy and not on_policy:
+                    inputs["use_off_policy_ce"] = True
 
             off_policy_prompts = None
             off_policy_completions = None
