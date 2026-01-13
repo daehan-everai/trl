@@ -472,9 +472,9 @@ class GOLDConfig(SFTConfig):
 
             if self.uld_crossentropy_weight != 0.0:
                 self.logger.warning(
-                    "`use_external_teacher_vllm=True` is label-free; forcing `uld_crossentropy_weight=0.0`."
+                    "`use_external_teacher_vllm=True` with `uld_crossentropy_weight>0` adds a CE anchor to the "
+                    "external-teacher loss; ensure this is intended for your run."
                 )
-                self.uld_crossentropy_weight = 0.0
 
             if not self.teacher_vllm_base_url:
                 raise ValueError("`teacher_vllm_base_url` must be a non-empty URL when `use_external_teacher_vllm=True`.")
