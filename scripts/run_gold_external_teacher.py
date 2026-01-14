@@ -19,12 +19,13 @@ import signal
 import subprocess
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.error import URLError
 
 import torch
-from datasets import load_dataset
+from datasets import load_dataset, load_from_disk
 from transformers import AutoConfig, AutoTokenizer
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -146,6 +147,11 @@ def ensure_port_available(port: int) -> int:
         except OSError:
             return get_free_port()
     return port
+
+
+def _slugify(value: str) -> str:
+    slug = "".join(ch if ch.isalnum() or ch in "-._" else "_" for ch in value)
+    return slug.strip("_") or "run"
 
 
 def _convert_sharegpt_messages(messages: list[dict[str, Any]]) -> list[dict[str, str]]:
@@ -325,10 +331,28 @@ def main() -> None:
         help="Maximum top-k per position for sparse full_logprobs format.",
     )
     parser.add_argument(
+        "--uld-matched-divergence",
+        default="jsd",
+        choices=["jsd", "skew_kl"],
+        help="Matched-token divergence for hybrid ULD loss ('jsd' or 'skew_kl').",
+    )
+    parser.add_argument(
+        "--uld-matched-forward-kl-weight",
+        type=float,
+        default=None,
+        help="Weight for KL(teacher||student) when --uld-matched-divergence=skew_kl.",
+    )
+    parser.add_argument(
+        "--uld-matched-reverse-kl-weight",
+        type=float,
+        default=None,
+        help="Weight for KL(student||teacher) when --uld-matched-divergence=skew_kl.",
+    )
+    parser.add_argument(
         "--uld-crossentropy-weight",
         type=float,
         default=0.0,
-        help="Weight for the cross-entropy loss component in ULD loss.",
+        help="Deprecated and ignored (no CE anchor on on-policy rollouts).",
     )
     parser.add_argument(
         "--teacher-max-input-tokens",
@@ -339,6 +363,17 @@ def main() -> None:
     parser.add_argument("--teacher-preflight-requests", type=int, default=3)
     parser.add_argument("--teacher-preflight-min-success", type=int, default=1)
     parser.add_argument("--output-dir", default="runs/gold-external-teacher")
+    parser.add_argument("--save-steps", type=int, default=50, help="Save a checkpoint every N steps.")
+    parser.add_argument(
+        "--save-processed-dataset",
+        default=None,
+        help="Optional path to save the processed dataset (after slicing/filtering).",
+    )
+    parser.add_argument(
+        "--save-processed-dataset-only",
+        action="store_true",
+        help="Save the processed dataset and exit before training.",
+    )
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--num-train-epochs", type=float, default=None)
     parser.add_argument("--per-device-train-batch-size", type=int, default=1)
@@ -369,6 +404,12 @@ def main() -> None:
         type=int,
         default=0,
         help="Seed used for deterministic random slicing during filtering.",
+    )
+    parser.add_argument(
+        "--max-messages-per-example",
+        type=int,
+        default=None,
+        help="If set, randomly slice each conversation to at most this many messages.",
     )
     parser.add_argument("--max-length", type=int, default=None)
     parser.add_argument(
@@ -446,11 +487,15 @@ def main() -> None:
     parser.add_argument("--wandb-project", default="trl-gold-external-teacher")
     parser.add_argument("--wandb-run-name", default=None)
     args = parser.parse_args()
+    if args.save_processed_dataset_only and not args.save_processed_dataset:
+        raise ValueError("--save-processed-dataset-only requires --save-processed-dataset.")
+    if args.save_steps is not None and args.save_steps <= 0:
+        raise ValueError("--save-steps must be > 0.")
 
     load_dotenv()
     if args.model_id is None:
         args.model_id = os.environ.get("STUDENT_MODEL_ID", DEFAULT_STUDENT_MODEL)
-    if "WANDB_API_KEY" not in os.environ:
+    if "WANDB_API_KEY" not in os.environ and not args.report_to_none and not args.save_processed_dataset_only:
         raise RuntimeError("Missing WANDB_API_KEY. Add it to `.env` or export it in your shell.")
     if "HUGGINGFACE_HUB_TOKEN" not in os.environ:
         raise RuntimeError("Missing HF_TOKEN/HUGGINGFACE_HUB_TOKEN. Add it to `.env` or export it in your shell.")
@@ -478,26 +523,40 @@ def main() -> None:
                 args.teacher_max_input_tokens = int(env_limit)
             except ValueError:
                 raise ValueError("TEACHER_MAX_INPUT_TOKENS must be an integer.")
+    skip_teacher = bool(args.save_processed_dataset_only)
     teacher_proc = None
-    if not teacher_url:
+    if not skip_teacher and not teacher_url:
         teacher_port = ensure_port_available(args.teacher_port)
         teacher_url = f"http://127.0.0.1:{teacher_port}/v1/completions"
         teacher_proc = start_dummy_teacher(port=teacher_port, vocab_size=len(teacher_tokenizer), seed=0)
     try:
-        token_id = teacher_tokenizer.eos_token_id or 0
-        wait_for_teacher_vllm(
-            base_url=teacher_url,
-            model_name=teacher_model_name,
-            vocab_size=len(teacher_tokenizer),
-            token_id=int(token_id),
-            timeout_s=60.0,
-            temperature=args.teacher_temperature,
-            full_logprobs_format=args.teacher_full_logprobs_format,
-            full_logprobs_top_p=args.teacher_full_logprobs_top_p,
-            full_logprobs_max_top_k=args.teacher_full_logprobs_max_top_k,
-        )
+        if not skip_teacher:
+            token_id = teacher_tokenizer.eos_token_id or 0
+            wait_for_teacher_vllm(
+                base_url=teacher_url,
+                model_name=teacher_model_name,
+                vocab_size=len(teacher_tokenizer),
+                token_id=int(token_id),
+                timeout_s=60.0,
+                temperature=args.teacher_temperature,
+                full_logprobs_format=args.teacher_full_logprobs_format,
+                full_logprobs_top_p=args.teacher_full_logprobs_top_p,
+                full_logprobs_max_top_k=args.teacher_full_logprobs_max_top_k,
+            )
 
-        dataset = load_dataset(args.dataset_id, split=args.dataset_split)
+        dataset_path = Path(args.dataset_id)
+        if dataset_path.exists():
+            dataset = load_from_disk(str(dataset_path))
+            if not hasattr(dataset, "column_names"):
+                if args.dataset_split in dataset:
+                    dataset = dataset[args.dataset_split]
+                else:
+                    raise ValueError(
+                        f"Saved dataset at {dataset_path} has splits {sorted(dataset.keys())}; "
+                        f"--dataset-split {args.dataset_split!r} is not available."
+                    )
+        else:
+            dataset = load_dataset(args.dataset_id, split=args.dataset_split)
         dataset = dataset.map(to_messages, remove_columns=dataset.column_names)
         dataset = dataset.map(ensure_assistant_final)
         initial_count = len(dataset)
@@ -525,6 +584,11 @@ def main() -> None:
         max_prompt_tokens = max_length - filter_completion_length
         if max_prompt_tokens <= 0:
             raise ValueError("filter_max_completion_length is too large for max_length.")
+        max_messages_per_example = args.max_messages_per_example
+        if max_messages_per_example is not None:
+            max_messages_per_example = int(max_messages_per_example)
+            if max_messages_per_example <= 1:
+                raise ValueError("max_messages_per_example must be > 1.")
 
         def build_prompt_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
             if not messages:
@@ -550,13 +614,16 @@ def main() -> None:
             return len(prompt_ids)
 
         def maybe_slice_messages(example: dict[str, Any], index: int) -> dict[str, Any]:
-            if not args.filter_random_slices:
+            if not args.filter_random_slices and max_messages_per_example is None:
                 return example
             messages = example.get("messages") or []
             if not messages:
                 return example
-            if prompt_length(messages) <= max_prompt_tokens:
+            if max_messages_per_example is None and prompt_length(messages) <= max_prompt_tokens:
                 return example
+            if max_messages_per_example is not None and len(messages) <= max_messages_per_example:
+                if prompt_length(messages) <= max_prompt_tokens:
+                    return example
 
             target_role = messages[-1].get("role")
             candidate_ends = [i for i, msg in enumerate(messages) if msg.get("role") == target_role]
@@ -570,20 +637,34 @@ def main() -> None:
             attempts = max(1, int(args.filter_slice_attempts))
             for _ in range(attempts):
                 end_idx = rng.choice(candidate_ends)
-                start_idx = rng.randint(0, end_idx)
+                min_start = 0
+                if max_messages_per_example is not None:
+                    min_start = max(0, end_idx - max_messages_per_example + 1)
+                start_idx = rng.randint(min_start, end_idx)
                 sliced = messages[start_idx : end_idx + 1]
                 if len(sliced) < min_messages:
+                    continue
+                if max_messages_per_example is not None and len(sliced) > max_messages_per_example:
+                    continue
+                if target_role == "assistant" and not any(msg.get("role") == "user" for msg in sliced[:-1]):
                     continue
                 if prompt_length(sliced) <= max_prompt_tokens:
                     return {"messages": sliced}
 
-            end_idx = candidate_ends[-1]
-            for start_idx in range(0, end_idx + 1):
-                sliced = messages[start_idx : end_idx + 1]
-                if len(sliced) < min_messages:
-                    continue
-                if prompt_length(sliced) <= max_prompt_tokens:
-                    return {"messages": sliced}
+            for end_idx in reversed(candidate_ends):
+                min_start = 0
+                if max_messages_per_example is not None:
+                    min_start = max(0, end_idx - max_messages_per_example + 1)
+                for start_idx in range(end_idx, min_start - 1, -1):
+                    sliced = messages[start_idx : end_idx + 1]
+                    if len(sliced) < min_messages:
+                        continue
+                    if max_messages_per_example is not None and len(sliced) > max_messages_per_example:
+                        continue
+                    if target_role == "assistant" and not any(msg.get("role") == "user" for msg in sliced[:-1]):
+                        continue
+                    if prompt_length(sliced) <= max_prompt_tokens:
+                        return {"messages": sliced}
 
             return example
 
@@ -591,15 +672,25 @@ def main() -> None:
             messages = example.get("messages") or []
             if not messages:
                 return False
+            if max_messages_per_example is not None and len(messages) > max_messages_per_example:
+                return False
             return prompt_length(messages) <= max_prompt_tokens
 
-        if args.filter_random_slices:
+        if args.filter_random_slices or max_messages_per_example is not None:
             dataset = dataset.map(maybe_slice_messages, with_indices=True)
         dataset = dataset.filter(keep_example)
         if len(dataset) == 0:
             raise ValueError("Filtered dataset is empty. Increase max_length or reduce max_completion_length.")
 
-        if args.teacher_preflight_requests > 0:
+        if args.save_processed_dataset:
+            save_path = Path(args.save_processed_dataset)
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            dataset.save_to_disk(str(save_path))
+            print(f"Saved processed dataset to {save_path}")
+            if args.save_processed_dataset_only:
+                return
+
+        if not skip_teacher and args.teacher_preflight_requests > 0:
             sample_messages = dataset[0]["messages"]
             student_text = tokenizer.apply_chat_template(
                 sample_messages, tokenize=False, add_generation_prompt=False
@@ -643,12 +734,15 @@ def main() -> None:
         if num_train_epochs is None:
             num_train_epochs = 1.0
 
-        save_strategy = "steps" if max_steps is not None else "epoch"
-        save_steps = max(1, max_steps) if max_steps is not None else 0
+        save_strategy = "steps"
+        save_steps = int(args.save_steps)
         max_steps_value = max_steps if max_steps is not None else -1
 
+        run_name = args.wandb_run_name or f"run_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+        output_dir = Path(args.output_dir) / _slugify(run_name)
+
         train_args = GOLDConfig(
-            output_dir=args.output_dir,
+            output_dir=str(output_dir),
             report_to=report_to,
             logging_steps=1,
             save_strategy=save_strategy,
@@ -680,6 +774,9 @@ def main() -> None:
             teacher_tokenizer_name_or_path=args.teacher_tokenizer,
             uld_teacher_temperature=args.teacher_temperature,
             uld_crossentropy_weight=args.uld_crossentropy_weight,
+            uld_matched_divergence=args.uld_matched_divergence,
+            uld_matched_forward_kl_weight=args.uld_matched_forward_kl_weight,
+            uld_matched_reverse_kl_weight=args.uld_matched_reverse_kl_weight,
             use_vllm=args.use_vllm,
             vllm_mode=args.vllm_mode,
             vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
@@ -733,7 +830,6 @@ def main() -> None:
 
         trainer = GOLDTrainer(
             model=args.model_id,
-            teacher_model=None,
             args=train_args,
             train_dataset=dataset,
             eval_dataset=None,

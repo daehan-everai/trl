@@ -39,14 +39,17 @@ class GOLDConfig(SFTConfig):
         beta (`float`, *optional*, defaults to `0.5`):
             Interpolation coefficient between `0.0` and `1.0` of the Generalized Jensen-Shannon Divergence loss. When
             beta is `0.0`, the loss is the KL divergence. When beta is `1.0`, the loss is the Inverse KL Divergence.
+        uld_matched_divergence (`str`, *optional*, defaults to `"jsd"`):
+            Divergence used for the matched-token component when hybrid ULD loss is enabled. Supported values are
+            `"jsd"` (generalized Jensen-Shannon) and `"skew_kl"` (weighted forward/reverse KL).
+        uld_matched_forward_kl_weight (`float`, *optional*, defaults to `None`):
+            Weight for KL(teacher||student) when `uld_matched_divergence="skew_kl"`. If both weights are `None`, uses
+            `(1 - beta)` for forward KL and `beta` for reverse KL.
+        uld_matched_reverse_kl_weight (`float`, *optional*, defaults to `None`):
+            Weight for KL(student||teacher) when `uld_matched_divergence="skew_kl"`. If both weights are `None`, uses
+            `(1 - beta)` for forward KL and `beta` for reverse KL.
         max_completion_length (`int`, *optional*, defaults to `128`):
             Maximum number of tokens to generate per completion.
-        teacher_model_name_or_path (`str` or `None`, *optional*, defaults to `None`):
-            Model name or path of the teacher model. If `None`, the teacher model will be the same as the model being
-            trained.
-        teacher_model_init_kwargs (`dict[str, Any]]` or `None`, *optional*, defaults to `None`):
-            Keyword arguments to pass to `AutoModelForCausalLM.from_pretrained` when instantiating the teacher model
-            from a string.
         teacher_tokenizer_name_or_path (`str` or `None`, *optional*, defaults to `None`):
             Tokenizer name or path for the teacher model. If None when using ULD loss, will use the same tokenizer as
             the student model (not recommended for cross-tokenizer distillation).
@@ -72,7 +75,7 @@ class GOLDConfig(SFTConfig):
             Whether to use Universal Logit Distillation (ULD) loss instead of Generalized Jensen-Shannon Divergence
             loss.
         uld_crossentropy_weight (`float`, *optional*, defaults to `0.0`):
-            Weight for the cross-entropy loss component in ULD loss. If 0, only ULD distillation loss is used.
+            Deprecated and ignored. Cross-entropy anchors on on-policy rollouts are no longer used.
         uld_distillation_weight (`float`, *optional*, defaults to `1.0`):
             Weight for the distillation loss component in ULD loss.
         uld_student_temperature (`float`, *optional*, defaults to `1.0`):
@@ -111,7 +114,7 @@ class GOLDConfig(SFTConfig):
 
     logger = logging.get_logger(__name__)
 
-    _VALID_DICT_FIELDS = TrainingArguments._VALID_DICT_FIELDS + ["teacher_model_init_kwargs"]
+    _VALID_DICT_FIELDS = TrainingArguments._VALID_DICT_FIELDS
 
     # Parameters whose default values are overridden from TrainingArguments
     learning_rate: float = field(
@@ -150,6 +153,25 @@ class GOLDConfig(SFTConfig):
             "Divergence."
         },
     )
+    uld_matched_divergence: str = field(
+        default="jsd",
+        metadata={
+            "help": "Matched-token divergence for hybrid ULD loss: 'jsd' (generalized Jensen-Shannon) or "
+            "'skew_kl' (weighted forward/reverse KL)."
+        },
+    )
+    uld_matched_forward_kl_weight: float | None = field(
+        default=None,
+        metadata={
+            "help": "Weight for KL(teacher||student) when uld_matched_divergence='skew_kl'. If None, uses (1 - beta)."
+        },
+    )
+    uld_matched_reverse_kl_weight: float | None = field(
+        default=None,
+        metadata={
+            "help": "Weight for KL(student||teacher) when uld_matched_divergence='skew_kl'. If None, uses beta."
+        },
+    )
     max_completion_length: int = field(
         default=128,
         metadata={"help": "Maximum number of tokens to generate per completion."},
@@ -158,20 +180,6 @@ class GOLDConfig(SFTConfig):
         default="main",
         metadata={
             "help": "Revision of the student model to use. If not specified, the default revision of the model will be used."
-        },
-    )
-    teacher_model_name_or_path: str | None = field(
-        default=None,
-        metadata={
-            "help": "Model name or path of the teacher model. If `None`, the teacher model will be the same as the "
-            "model being trained."
-        },
-    )
-    teacher_model_init_kwargs: dict[str, Any] | None = field(
-        default=None,
-        metadata={
-            "help": "Keyword arguments to pass to `AutoModelForCausalLM.from_pretrained` when instantiating the "
-            "teacher model from a string."
         },
     )
     teacher_tokenizer_name_or_path: str | None = field(
@@ -470,12 +478,6 @@ class GOLDConfig(SFTConfig):
                     "with an assistant completion for those steps."
                 )
 
-            if self.uld_crossentropy_weight != 0.0:
-                self.logger.warning(
-                    "`use_external_teacher_vllm=True` with `uld_crossentropy_weight>0` adds a CE anchor to the "
-                    "external-teacher loss; ensure this is intended for your run."
-                )
-
             if not self.teacher_vllm_base_url:
                 raise ValueError("`teacher_vllm_base_url` must be a non-empty URL when `use_external_teacher_vllm=True`.")
             if self.teacher_vllm_timeout <= 0:
@@ -524,6 +526,22 @@ class GOLDConfig(SFTConfig):
                 raise ValueError("uld_student_temperature must be positive.")
             if self.uld_teacher_temperature <= 0.0:
                 raise ValueError("uld_teacher_temperature must be positive.")
+            if self.uld_crossentropy_weight != 0.0:
+                self.logger.warning("`uld_crossentropy_weight` is deprecated and ignored; setting it to 0.0.")
+                self.uld_crossentropy_weight = 0.0
+            if self.uld_matched_divergence not in {"jsd", "skew_kl"}:
+                raise ValueError("uld_matched_divergence must be 'jsd' or 'skew_kl'.")
+            if self.uld_matched_forward_kl_weight is None and self.uld_matched_reverse_kl_weight is None:
+                pass
+            elif self.uld_matched_forward_kl_weight is None or self.uld_matched_reverse_kl_weight is None:
+                raise ValueError(
+                    "uld_matched_forward_kl_weight and uld_matched_reverse_kl_weight must both be set or both None."
+                )
+            else:
+                if self.uld_matched_forward_kl_weight < 0.0 or self.uld_matched_reverse_kl_weight < 0.0:
+                    raise ValueError("Matched KL weights must be non-negative.")
+                if self.uld_matched_forward_kl_weight + self.uld_matched_reverse_kl_weight <= 0.0:
+                    raise ValueError("Matched KL weights must sum to a positive value.")
 
             # Validate hybrid loss weights - both must be None or both must be set
             if self.uld_use_hybrid_loss:

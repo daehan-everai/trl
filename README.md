@@ -47,24 +47,45 @@ nohup env HF_HOME=/workspace/.cache/huggingface \
   --teacher-full-logprobs-format top_p \
   --teacher-full-logprobs-top-p 0.9999 \
   --teacher-full-logprobs-max-top-k 1024 \
+  --uld-matched-divergence skew_kl \
+  --uld-matched-forward-kl-weight 0.7 \
+  --uld-matched-reverse-kl-weight 0.3 \
+  --save-steps 50 \
   --teacher-timeout 10 \
   --teacher-max-retries 1 \
-  --max-length 2048 \
-  --max-completion-length 256 \
+  --max-length 1280 \
+  --max-completion-length 128 \
+  --max-messages-per-example 30 \
+  --save-processed-dataset runs/gold-external-teacher/datasets/french-conversations-30msg-1152prompt \
   --teacher-max-input-tokens 2950 \
   --use-lora \
   --lora-r 32 \
   --learning-rate 1e-5 \
   --num-train-epochs 1 \
-  --per-device-train-batch-size 15 \
+  --per-device-train-batch-size 12 \
   --gradient-accumulation-steps 4 \
   --log-rollouts \
   --log-rollouts-steps 1 \
   --rollouts-per-log 3 \
-  --lmbda 0.9 \
+  --lmbda 1.0 \
   --disable-unmatched-loss \
   > runs/gold-external-teacher/teacher_run.log 2>&1 & echo $!
 ```
+
+## Save a sliced dataset (no training)
+```bash
+python scripts/run_gold_external_teacher.py \
+  --model-id EverAI-AI/MagistSmall-Raven-ALT-2 \
+  --dataset-id EverAI-AI/french-conversations-prompt \
+  --dataset-split train \
+  --max-length 1280 \
+  --max-completion-length 128 \
+  --max-messages-per-example 30 \
+  --save-processed-dataset runs/gold-external-teacher/datasets/french-conversations-30msg-1152prompt \
+  --save-processed-dataset-only \
+  --report-to-none
+```
+To reuse a saved dataset, pass the path as `--dataset-id` (split is ignored unless the saved dataset contains splits).
 
 ## Best practices
 - Start with a short sanity run (`--max-steps 1` or small split) before a full epoch.
@@ -72,7 +93,13 @@ nohup env HF_HOME=/workspace/.cache/huggingface \
 - For on-policy-only runs (`--lmbda 1.0`), the dataset should end on a user turn.
 - For any off-policy loss (`--lmbda < 1.0`), the dataset must end on an assistant turn and include at least one user turn.
 - When `0 < --lmbda < 1`, on-policy and off-policy losses are computed every batch and combined as a weighted sum.
+- Off-policy loss is CE on dataset completions; on-policy CE anchors are disabled (`--uld-crossentropy-weight` is ignored).
 - Keep `--max-length` and `--teacher-max-input-tokens` within the teacher’s context window.
+- Prompt budget is `--max-length - --max-completion-length`.
+- Use `--max-messages-per-example` to slice long conversations instead of dropping them when lowering prompt budgets.
+- Save processed datasets with `--save-processed-dataset` so future runs reuse the same slicing.
+- Checkpoints are saved every `--save-steps` into a per-run subdirectory under `--output-dir`.
+- For hybrid ULD matched tokens, you can choose `--uld-matched-divergence` and optionally weight forward/reverse KL.
 - Always verify W&B completions end at the stop marker and do **not** include a new user turn.
 
 ## Quick sanity (1-step, local dummy teacher)
@@ -102,9 +129,10 @@ env HF_HOME=/workspace/.cache/huggingface \
 ## Monitoring
 - Log file: `runs/gold-external-teacher/teacher_run.log`
 - W&B: use the run URL printed in the log.
-- Confirm off-policy is active by checking `off_policy_loss` and `off_policy_fraction` (should be `1 - lmbda`).
+- Confirm off-policy is active by checking `off_policy_loss` when `--lmbda < 1`.
 - Confirm completions are valid by checking `num_valid_completion_tokens` stays > 0.
 - W&B tables: `completions` (on-policy) and `off_policy_completions` (dataset completions).
+- For `--uld-matched-divergence skew_kl`, `forward` means KL(teacher||student) and `reverse` means KL(student||teacher).
 - Check for teacher request errors:
 ```bash
 rg -n "Teacher endpoint error|prompt_len|positions_min|positions_max" runs/gold-external-teacher/teacher_run.log

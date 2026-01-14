@@ -47,7 +47,6 @@ from transformers.trainer_callback import TrainerCallback, TrainerControl, Train
 from transformers.trainer_utils import EvalPrediction
 from transformers.utils import (
     is_flash_attn_2_available,
-    is_liger_kernel_available,
     is_peft_available,
     is_rich_available,
     is_sagemaker_mp_enabled,
@@ -57,11 +56,9 @@ from ...data_utils import is_conversational, maybe_convert_to_chatml, pack_datas
 from ...extras.profiling import profiling_decorator
 from ...extras.vllm_client import VLLMClient
 from ...import_utils import is_vllm_available
-from ...models import prepare_deepspeed
 from ...models.utils import unwrap_model_for_generation
 from ...trainer.sft_trainer import SFTTrainer
 from ...trainer.utils import (
-    create_model_from_path,
     disable_dropout_in_model,
     empty_cache,
     ensure_master_addr_port,
@@ -81,9 +78,6 @@ if is_wandb_available():
 if is_vllm_available():
     from vllm import LLM, SamplingParams
     from vllm.sampling_params import GuidedDecodingParams
-
-if is_liger_kernel_available():
-    from liger_kernel.chunked_loss import LigerFusedLinearJSDLoss
 
 if is_rich_available():
     from rich.console import Console
@@ -364,7 +358,10 @@ class ULDLoss(nn.Module):
         self.use_hybrid_loss = getattr(config, "uld_use_hybrid_loss", False)
         self.hybrid_matched_weight = getattr(config, "uld_hybrid_matched_weight", None)
         self.hybrid_unmatched_weight = getattr(config, "uld_hybrid_unmatched_weight", None)
-        self.beta = getattr(config, "beta", 1.0)  # For JSD loss in hybrid matched tokens
+        self.beta = getattr(config, "beta", 1.0)  # For matched-token divergence weighting in hybrid loss
+        self.matched_divergence = getattr(config, "uld_matched_divergence", "jsd")
+        self.matched_forward_kl_weight = getattr(config, "uld_matched_forward_kl_weight", None)
+        self.matched_reverse_kl_weight = getattr(config, "uld_matched_reverse_kl_weight", None)
 
         # Initialize vocabulary mapping for hybrid loss
         self._vocab_mapping = None
@@ -390,22 +387,12 @@ class ULDLoss(nn.Module):
         Returns:
             Total loss (cross-entropy + distillation)
         """
-        # Compute cross-entropy loss for student
-        if self.crossentropy_weight > 0:
-            shift_logits = student_logits[..., :-1, :].contiguous()
-            shift_labels = student_labels[..., 1:].contiguous()
-            loss_fct = nn.CrossEntropyLoss(ignore_index=self.ignore_index)
-            crossentropy_loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-            crossentropy_loss = self.crossentropy_weight * crossentropy_loss
-        else:
-            crossentropy_loss = 0.0
-
         # Compute distillation loss using ULD approximation
         distillation_loss = self._compute_distillation_loss(
             student_logits, teacher_logits, student_labels, teacher_labels, student_input_ids, teacher_input_ids
         )
 
-        return crossentropy_loss + distillation_loss
+        return distillation_loss
 
     def _initialize_vocabulary_mapping(self):
         """Initialize vocabulary mapping for hybrid ULD loss."""
@@ -775,7 +762,8 @@ class ULDLoss(nn.Module):
             teacher_matched_mask[teacher_matched_indices] = True
             student_matched_mask[student_matched_indices] = True
 
-        # 1. Jensen-Shannon divergence on matched vocabulary tokens (direct semantic correspondence)
+        # 1. Matched-token divergence (JSD by default, optional skewed forward/reverse KL).
+        # Forward KL = KL(teacher || student), reverse KL = KL(student || teacher).
         matched_loss = torch.tensor(0.0, device=device)
         matched_token_count = 0
         if len(teacher_matched_indices) > 0:
@@ -787,6 +775,18 @@ class ULDLoss(nn.Module):
             eps = 1e-8
             beta = float(self.beta) if self.beta is not None else 0.5
             beta = min(max(beta, 0.0), 1.0)
+            divergence = self.matched_divergence
+            forward_weight = self.matched_forward_kl_weight
+            reverse_weight = self.matched_reverse_kl_weight
+            if divergence == "skew_kl":
+                if forward_weight is None and reverse_weight is None:
+                    forward_weight = 1.0 - beta
+                    reverse_weight = beta
+                else:
+                    total_weight = float(forward_weight) + float(reverse_weight)
+                    if total_weight > 0:
+                        forward_weight = float(forward_weight) / total_weight
+                        reverse_weight = float(reverse_weight) / total_weight
             if (teacher_matched_probs == 0).any():
                 per_row_losses = []
                 for row in range(teacher_matched_probs.size(0)):
@@ -798,22 +798,36 @@ class ULDLoss(nn.Module):
                     teacher_row = teacher_row[valid]
                     p = student_row.clamp_min(eps)
                     q = teacher_row.clamp_min(eps)
-                    m = (1.0 - beta) * p + beta * q
-                    m = m.clamp_min(eps)
-                    kl_p = (p * (p.log() - m.log())).sum()
-                    kl_q = (q * (q.log() - m.log())).sum()
-                    per_row_losses.append((1.0 - beta) * kl_p + beta * kl_q)
+                    if divergence == "skew_kl":
+                        kl_student_teacher = (p * (p.log() - q.log())).sum()
+                        kl_teacher_student = (q * (q.log() - p.log())).sum()
+                        per_row_losses.append(
+                            forward_weight * kl_teacher_student + reverse_weight * kl_student_teacher
+                        )
+                    else:
+                        m = (1.0 - beta) * p + beta * q
+                        m = m.clamp_min(eps)
+                        kl_p = (p * (p.log() - m.log())).sum()
+                        kl_q = (q * (q.log() - m.log())).sum()
+                        per_row_losses.append((1.0 - beta) * kl_p + beta * kl_q)
                 if per_row_losses:
                     # Normalize by the number of valid rows to avoid down-weighting sparse alignment.
                     matched_loss = torch.stack(per_row_losses).sum() / max(1, len(per_row_losses))
             else:
                 p = student_matched_probs.clamp_min(eps)
                 q = teacher_matched_probs.clamp_min(eps)
-                m = (1.0 - beta) * p + beta * q
-                m = m.clamp_min(eps)
-                kl_p = (p * (p.log() - m.log())).sum()
-                kl_q = (q * (q.log() - m.log())).sum()
-                matched_loss = ((1.0 - beta) * kl_p + beta * kl_q) / max(1, student_aligned.size(0))
+                if divergence == "skew_kl":
+                    kl_student_teacher = (p * (p.log() - q.log())).sum()
+                    kl_teacher_student = (q * (q.log() - p.log())).sum()
+                    matched_loss = (forward_weight * kl_teacher_student + reverse_weight * kl_student_teacher) / max(
+                        1, student_aligned.size(0)
+                    )
+                else:
+                    m = (1.0 - beta) * p + beta * q
+                    m = m.clamp_min(eps)
+                    kl_p = (p * (p.log() - m.log())).sum()
+                    kl_q = (q * (q.log() - m.log())).sum()
+                    matched_loss = ((1.0 - beta) * kl_p + beta * kl_q) / max(1, student_aligned.size(0))
 
         # 2. Sorted comparison loss for unmatched vocabulary tokens
         teacher_unmatched_mask = ~teacher_matched_mask
@@ -948,7 +962,6 @@ class GOLDTrainer(SFTTrainer):
     def __init__(
         self,
         model: PreTrainedModel | nn.Module | str | None = None,
-        teacher_model: PreTrainedModel | nn.Module | str = None,
         args: GOLDConfig | None = None,
         data_collator: DataCollator | None = None,  # type: ignore
         train_dataset: Dataset | None = None,
@@ -972,6 +985,8 @@ class GOLDTrainer(SFTTrainer):
                 "vLLM on-policy rollouts are disabled for external-teacher mode. "
                 "Remove `--use-vllm` to proceed."
             )
+        if not self.use_external_teacher_vllm:
+            raise ValueError("GOLDTrainer now supports only external-teacher mode (set use_external_teacher_vllm=True).")
         if isinstance(model, str) and self.model_revision is not None:
             args.model_init_kwargs = args.model_init_kwargs or {}
             args.model_init_kwargs.setdefault("revision", self.model_revision)
@@ -980,47 +995,9 @@ class GOLDTrainer(SFTTrainer):
         if data_collator is None:
             data_collator = DataCollatorForChatML(tokenizer=processing_class, max_length=args.max_length)
 
-        # Liger fused GKD loss (JSD)
-        self.use_liger_gkd_loss = False
-        if args.use_liger_kernel:
-            self.liger_jsd_loss = LigerFusedLinearJSDLoss(
-                beta=args.beta,
-                ignore_index=-100,
-                temperature=args.temperature,
-                compiled=False,
-            )
-            self.use_liger_gkd_loss = True
-
-        teacher_model_init_kwargs = {}
-        if not self.use_external_teacher_vllm:
-            if args.teacher_model_init_kwargs is None:
-                teacher_model_init_kwargs = {}
-            elif not isinstance(teacher_model, str):
-                raise ValueError(
-                    "You passed teacher_model_init_kwargs to the GOLDConfig, but your teacher_model is already instantiated."
-                )
-            else:
-                teacher_model_init_kwargs = args.teacher_model_init_kwargs
-                teacher_model_init_kwargs["torch_dtype"] = (
-                    teacher_model_init_kwargs["torch_dtype"]
-                    if teacher_model_init_kwargs["torch_dtype"] in ["auto", None]
-                    else getattr(torch, teacher_model_init_kwargs["torch_dtype"])
-                )
-
-        if args.use_uld_loss and args.teacher_tokenizer_name_or_path is None:
-            if isinstance(teacher_model, str):
-                args.teacher_tokenizer_name_or_path = teacher_model
-            else:
-                raise ValueError(
-                    "`teacher_tokenizer_name_or_path` must be set when using ULD loss with a pre-instantiated teacher model."
-                )
-
-        if not self.use_external_teacher_vllm and isinstance(teacher_model, str):
-            init_kwargs = dict(teacher_model_init_kwargs)
-            if "torch_dtype" in init_kwargs and "dtype" not in init_kwargs:
-                init_kwargs["dtype"] = init_kwargs.pop("torch_dtype")
-            teacher_model = create_model_from_path(teacher_model, **init_kwargs)
         self.use_uld_loss = args.use_uld_loss
+        if not self.use_uld_loss:
+            raise ValueError("External-teacher mode requires `use_uld_loss=True`.")
         self.teacher_tokenizer = None
         if args.use_uld_loss and args.teacher_tokenizer_name_or_path is not None:
             self.teacher_tokenizer = AutoTokenizer.from_pretrained(args.teacher_tokenizer_name_or_path)
@@ -1059,22 +1036,11 @@ class GOLDTrainer(SFTTrainer):
 
         if args.disable_dropout:
             disable_dropout_in_model(self.model)
-        if not self.use_external_teacher_vllm:
-            if not args.use_uld_loss:
-                teacher_model.resize_token_embeddings(self.model.config.vocab_size)
-
-            if self.is_deepspeed_enabled:
-                self.teacher_model = prepare_deepspeed(teacher_model, self.accelerator)
-            else:
-                self.teacher_model = self.accelerator.prepare_model(teacher_model, evaluation_mode=True)
-        else:
-            self.teacher_model = None
 
         self.lmbda = args.lmbda
         self.beta = args.beta
         self.temperature = args.temperature
         self.top_p = args.top_p
-        self.seq_kd = args.seq_kd
 
         # Track per-step loss statistics for on/off-policy batches (used in logging)
         self._on_policy_loss_total = 0.0
@@ -1533,99 +1499,7 @@ class GOLDTrainer(SFTTrainer):
                     map_kwargs["desc"] = f"Truncating {dataset_name} dataset"
                 dataset = truncate_dataset(dataset, args.max_length, map_kwargs)
 
-            if args.use_liger_kernel:
-                required_columns = {
-                    "input_ids",
-                    "attention_mask",
-                    "position_ids",
-                    "completion_mask",
-                    "assistant_masks",
-                    "original_prompt_text",
-                    "original_completion_text",
-                }
-                dataset = dataset.select_columns(required_columns.intersection(dataset.column_names))
-
         return dataset
-
-    @staticmethod
-    def generalized_jsd_loss(
-        student_logits,
-        teacher_logits,
-        labels=None,
-        beta=0.5,
-        temperature=1.0,
-        reduction="batchmean",
-        logits_are_probs=False,
-    ):
-        """
-        Compute the generalized Jensen-Shannon Divergence loss for knowledge distillation using F.kl_div. See Eq. (1)
-        of https://huggingface.co/papers/2306.13649 for the definition.
-
-        Args:
-            student_logits:
-                Tensor of shape (batch_size, sequence_length, vocab_size)
-            teacher_logits:
-                Tensor of shape (batch_size, sequence_length, vocab_size)
-            labels:
-                Tensor of shape (batch_size, sequence_length) with -100 for padding tokens to ignore when computing
-                loss
-            beta:
-                Interpolation coefficient between 0 and 1 (default: 0.5)
-            temperature:
-                Softmax temperature (default: 1.0)
-            reduction:
-                Specifies the reduction to apply to the output (default: 'batchmean')
-
-        Returns:
-            loss: Scalar tensor with the generalized JSD loss
-        """
-
-        if logits_are_probs:
-            student_log_probs = torch.log(student_logits.clamp_min(1e-8))
-            teacher_log_probs = torch.log(teacher_logits.clamp_min(1e-8))
-        else:
-            # Apply temperature scaling to logits before computing probabilities
-            student_logits = student_logits / temperature
-            teacher_logits = teacher_logits / temperature
-            # Compute log probabilities for student and probabilities for teacher
-            student_log_probs = F.log_softmax(student_logits, dim=-1)
-            teacher_log_probs = F.log_softmax(teacher_logits, dim=-1)
-
-        if beta == 0:
-            jsd = F.kl_div(student_log_probs, teacher_log_probs, reduction="none", log_target=True)
-        elif beta == 1:
-            jsd = F.kl_div(teacher_log_probs, student_log_probs, reduction="none", log_target=True)
-        else:
-            # Compute the log of the mixture distribution
-            # log(a + b) = log(exp(log(a)) + exp(log(b))) -> for mixture
-            beta = torch.tensor(beta, dtype=student_log_probs.dtype, device=student_log_probs.device)
-            mixture_log_probs = torch.logsumexp(
-                torch.stack([student_log_probs + torch.log1p(-beta), teacher_log_probs + torch.log(beta)]),
-                dim=0,
-            )
-
-            # Compute KL divergences using F.kl_div
-            # PyTorch differs from the standard mathematical definition, so the order of the probability distributions is swapped compared to that defined in the paper.
-            kl_teacher = F.kl_div(mixture_log_probs, teacher_log_probs, reduction="none", log_target=True)
-            kl_student = F.kl_div(mixture_log_probs, student_log_probs, reduction="none", log_target=True)
-
-            # Compute the Generalized Jensen-Shannon Divergence
-            jsd = beta * kl_teacher + (1 - beta) * kl_student
-
-        # Masking
-        if labels is not None:
-            mask = labels != -100
-            jsd = jsd[mask]
-
-        # Apply reduction
-        if reduction == "batchmean":
-            return jsd.sum() / mask.sum() if labels is not None else jsd.sum() / jsd.size(0)
-        elif reduction == "sum":
-            return jsd.sum()
-        elif reduction == "mean":
-            return jsd.mean()
-        else:
-            return jsd
 
     def _compute_off_policy_ce_loss(self, model, inputs, return_outputs=False):
         labels = inputs.get("labels")
@@ -1838,13 +1712,6 @@ class GOLDTrainer(SFTTrainer):
             distillation_loss = torch.stack(distillation_losses).mean()
             loss = self.uld_loss_fn.distillation_weight * distillation_loss
 
-            if self.uld_loss_fn.crossentropy_weight > 0:
-                shift_logits = outputs_student.logits[..., :-1, :].contiguous()
-                shift_labels = student_labels[..., 1:].contiguous()
-                loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
-                ce_loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-                loss = loss + (self.uld_loss_fn.crossentropy_weight * ce_loss)
-
             if matched_losses and unmatched_losses:
                 self.uld_loss_fn.last_matched_loss = torch.stack(matched_losses).mean()
                 self.uld_loss_fn.last_unmatched_loss = torch.stack(unmatched_losses).mean()
@@ -1871,203 +1738,6 @@ class GOLDTrainer(SFTTrainer):
 
             empty_cache()
             return (loss, outputs_student) if return_outputs else loss
-
-        if self.use_uld_loss and self.teacher_tokenizer is not None:
-            if "original_prompt_text" in inputs and "original_completion_text" in inputs:
-                prompt_texts = inputs["original_prompt_text"]
-                completion_texts = inputs["original_completion_text"]
-                full_texts = [p + c for p, c in zip(prompt_texts, completion_texts, strict=True)]
-            else:
-                # Fallback: decode student input_ids (current approach)
-                # WARNING: This may not work perfectly for cross-tokenizer distillation
-                full_sequences = inputs["input_ids"]
-                full_texts = self.processing_class.batch_decode(full_sequences, skip_special_tokens=False)
-
-                # Try to split prompt/completion using original prompt length
-                prompt_lengths = inputs["prompts"].shape[1]
-                prompt_texts = self.processing_class.batch_decode(inputs["prompts"], skip_special_tokens=False)
-                completion_texts = [
-                    full.replace(prompt, "", 1) for full, prompt in zip(full_texts, prompt_texts, strict=True)
-                ]
-
-            (
-                teacher_input_ids,
-                teacher_labels,
-                teacher_attention_mask,
-                teacher_prompt_length,
-            ) = build_teacher_inputs_from_texts(
-                self.teacher_tokenizer,
-                prompt_texts,
-                completion_texts,
-            )
-
-            teacher_input_ids = teacher_input_ids.to(self.accelerator.device)
-            teacher_labels = teacher_labels.to(self.accelerator.device)
-            teacher_attention_mask = teacher_attention_mask.to(self.accelerator.device)
-
-            outputs_student = model(
-                input_ids=inputs["input_ids"],
-                attention_mask=inputs["attention_mask"],
-                use_cache=False,
-            )
-
-            self.teacher_model.eval()
-            with torch.no_grad():
-                outputs_teacher = self.teacher_model(
-                    input_ids=teacher_input_ids,
-                    attention_mask=teacher_attention_mask,
-                )
-
-            # These are not used for ULD loss but are needed if JSD loss were to be used in this branch
-            student_prompt_length = inputs["prompts"].shape[1]
-            shifted_student_logits = outputs_student.logits[:, student_prompt_length - 1 : -1, :]
-            shifted_teacher_logits = outputs_teacher.logits[:, teacher_prompt_length - 1 : -1, :]
-            shifted_labels = inputs["labels"][:, student_prompt_length:]
-        else:
-            if self.use_liger_gkd_loss:
-                # Forward only through the base models (avoid lm_head to save memory)
-                unwrapped_student = self.accelerator.unwrap_model(model)
-                if hasattr(unwrapped_student, "get_decoder") and unwrapped_student.get_decoder() is not None:
-                    base_student = unwrapped_student.get_decoder()
-                else:
-                    base_student = getattr(
-                        unwrapped_student, getattr(unwrapped_student, "base_model_prefix", "model"), unwrapped_student
-                    )
-
-                student_outputs = base_student(
-                    input_ids=inputs["input_ids"],
-                    attention_mask=inputs["attention_mask"],
-                    use_cache=False,
-                )
-
-                self.teacher_model.eval()
-                unwrapped_teacher = self.accelerator.unwrap_model(self.teacher_model)
-                if hasattr(unwrapped_teacher, "get_decoder") and unwrapped_teacher.get_decoder() is not None:
-                    base_teacher = unwrapped_teacher.get_decoder()
-                else:
-                    base_teacher = getattr(
-                        unwrapped_teacher, getattr(unwrapped_teacher, "base_model_prefix", "model"), unwrapped_teacher
-                    )
-                with torch.no_grad():
-                    teacher_outputs = base_teacher(
-                        input_ids=inputs["input_ids"],
-                        attention_mask=inputs["attention_mask"],
-                        use_cache=False,
-                    )
-
-                # hidden states (shifted)
-                student_hidden = student_outputs.last_hidden_state[:, :-1]
-                teacher_hidden = teacher_outputs.last_hidden_state[:, :-1]
-
-                # Release full outputs to free memory
-                del student_outputs, teacher_outputs
-
-                # labels mask and labels (shifted)
-                labels_mask = inputs["labels"] != -100
-                masked_input_ids = torch.where(
-                    labels_mask, inputs["input_ids"], torch.full_like(inputs["input_ids"], -100)
-                )
-                true_labels = masked_input_ids[:, 1:].contiguous()
-
-                # heads
-                student_head = unwrapped_student.get_output_embeddings()
-                teacher_head = unwrapped_teacher.get_output_embeddings()
-
-                # liger fused jsd loss
-                loss = self.liger_jsd_loss(
-                    student_input=student_hidden,
-                    student_weight=student_head.weight,
-                    teacher_input=teacher_hidden,
-                    teacher_weight=teacher_head.weight,
-                    true_labels=true_labels,
-                    student_bias=getattr(student_head, "bias", None),
-                    teacher_bias=getattr(teacher_head, "bias", None),
-                )
-
-                # Release hidden states after loss computation
-                del student_hidden, teacher_hidden, true_labels
-            else:
-                # Original behavior for same tokenizer or when teacher_tokenizer is not provided
-                outputs_student = model(
-                    input_ids=inputs["input_ids"],
-                    attention_mask=inputs["attention_mask"],
-                )
-
-                self.teacher_model.eval()
-                with torch.no_grad():
-                    outputs_teacher = self.teacher_model(
-                        input_ids=inputs["input_ids"],
-                        attention_mask=inputs["attention_mask"],
-                    )
-
-                prompt_lengths = inputs["prompts"].shape[1]
-                shifted_student_logits = outputs_student.logits[:, prompt_lengths - 1 : -1, :]
-                shifted_teacher_logits = outputs_teacher.logits[:, prompt_lengths - 1 : -1, :]
-                shifted_labels = inputs["labels"][:, prompt_lengths:]
-                loss = self.generalized_jsd_loss(
-                    student_logits=shifted_student_logits,
-                    teacher_logits=shifted_teacher_logits,
-                    labels=shifted_labels,
-                    beta=self.beta,
-                )
-
-        if self.use_uld_loss:
-            student_input_ids = inputs["input_ids"]
-
-            # Use the *teacher* labels created above, not the student's.
-            teacher_labels_for_loss = teacher_labels if "teacher_labels" in locals() else inputs["labels"]
-            teacher_input_ids_for_loss = teacher_input_ids if "teacher_input_ids" in locals() else inputs["input_ids"]
-
-            # Create properly masked student labels (fixing batch size > 1 issue)
-            student_labels = inputs["labels"].clone()
-            if hasattr(self.processing_class, "pad_token_id") and self.processing_class.pad_token_id is not None:
-                student_labels[student_labels == self.processing_class.pad_token_id] = -100
-
-            # Also mask pad tokens in teacher labels for consistency
-            if (
-                hasattr(self, "teacher_tokenizer")
-                and hasattr(self.teacher_tokenizer, "pad_token_id")
-                and self.teacher_tokenizer.pad_token_id is not None
-            ):
-                teacher_labels[teacher_labels == self.teacher_tokenizer.pad_token_id] = -100
-
-            loss = self.uld_loss_fn(
-                student_logits=outputs_student.logits,
-                teacher_logits=outputs_teacher.logits,
-                student_labels=student_labels,
-                teacher_labels=teacher_labels_for_loss,
-                student_input_ids=student_input_ids,
-                teacher_input_ids=teacher_input_ids_for_loss,
-            )
-
-            # If ULD hybrid mode produced per-step matched/unmatched components, accumulate them for logging.
-            # Use gradient_accumulation_steps to mirror Trainer's windowing behavior.
-            if hasattr(self.uld_loss_fn, "last_matched_loss") and hasattr(self.uld_loss_fn, "last_unmatched_loss"):
-                try:
-                    ga = max(1, int(self.args.gradient_accumulation_steps))
-                except Exception:
-                    ga = 1
-                step_eq = 1.0 / ga
-                # read scalar values for logging
-                matched_val = (
-                    self.uld_loss_fn.last_matched_loss.item()
-                    if self.uld_loss_fn.last_matched_loss is not None
-                    else 0.0
-                )
-                unmatched_val = (
-                    self.uld_loss_fn.last_unmatched_loss.item()
-                    if self.uld_loss_fn.last_unmatched_loss is not None
-                    else 0.0
-                )
-
-                self._matched_sum += matched_val
-                self._unmatched_sum += unmatched_val
-                self._matched_step_eq += step_eq
-                self._unmatched_step_eq += step_eq
-
-        empty_cache()
-
-        return (loss, outputs_student) if return_outputs else loss
 
     @staticmethod
     def _strip_leading_assistant_prompt(prompt_text: str, completion_text: str) -> str:
@@ -2828,15 +2498,6 @@ class GOLDTrainer(SFTTrainer):
                 logs["on_policy_loss"] = round(on_sum / on_eq, 4)
             if off_eq > 0:
                 logs["off_policy_loss"] = round(off_sum / off_eq, 4)
-            logs["on_policy_steps"] = round(on_eq, 4)
-            logs["off_policy_steps"] = round(off_eq, 4)
-            total_eq = on_eq + off_eq
-            if total_eq > 0:
-                if on_eq > 0 and off_eq > 0 and 0.0 < self.lmbda < 1.0:
-                    logs["off_policy_fraction"] = round(1.0 - self.lmbda, 4)
-                else:
-                    logs["off_policy_fraction"] = round(off_eq / total_eq, 4)
-
             # matched/unmatched averaged over same logging window (if present)
             if matched_eq > 0:
                 logs["matched_loss"] = round(matched_sum / matched_eq, 4)

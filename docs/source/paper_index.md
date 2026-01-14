@@ -945,8 +945,9 @@ from trl.experimental import GOLDConfig
 config = GOLDConfig(
     lmbda=1.0, # student produces rollouts for all batches
     beta=1.0, # to ensure reverse-kl as the loss function
-    teacher_model_name_or_path="teacher-model", # specify the teacher model
-
+    use_external_teacher_vllm=True, # use a vLLM teacher endpoint
+    teacher_vllm_model_name="teacher-model", # name served by the endpoint
+    teacher_tokenizer_name_or_path="teacher-model", # tokenizer for alignment
 )
 ```
 

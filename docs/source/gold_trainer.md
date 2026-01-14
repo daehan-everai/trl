@@ -23,42 +23,18 @@ Key capabilities:
 The [`GOLDTrainer`] subclasses [`SFTTrainer`] and accepts the same datasets as other TRL trainers (lists of ChatML style
 messages). Important configuration flags on [`GOLDConfig`] include:
 
-* `use_uld_loss` – toggles Universal Logit Distillation. Set this to `True` for cross-tokenizer setups.
+* `use_external_teacher_vllm` – enables the external vLLM teacher endpoint (required for GOLD).
+* `teacher_vllm_base_url`, `teacher_vllm_model_name` – how to reach the external teacher and select its model name.
 * `teacher_tokenizer_name_or_path` – required when `use_uld_loss=True`; GOLD uses the teacher tokenizer to align tokens.
-* `uld_use_hybrid_loss`, `uld_hybrid_matched_weight`, `uld_hybrid_unmatched_weight` – enables and weights the hybrid
-  matched/unmatched loss.
-* `beta`, `lmbda`, `seq_kd` – inherited from [`experimental.gkd.GKDConfig`], controlling the generalized JSD interpolation and on-policy
-  sampling ratio.
+* `use_uld_loss`, `uld_use_hybrid_loss`, `uld_hybrid_matched_weight`, `uld_hybrid_unmatched_weight` – enables and weights ULD loss terms.
+* `beta`, `lmbda` – control the matched-token divergence and the on-/off-policy mix.
 
 A minimal end-to-end example:
 
 ```python
 from datasets import load_dataset
 from trl.experimental.gold import GOLDConfig, GOLDTrainer
-
-train_dataset = load_dataset(
-    "HuggingFaceTB/OpenR1-Math-220k-default-verified",
-    "all",
-    split="train[:1024]",
-)
-
-trainer = GOLDTrainer(
-    model="meta-llama/Llama-3.2-1B-Instruct",
-    teacher_model="Qwen/Qwen2.5-0.5B-Instruct",
-    args=GOLDConfig(output_dir="gold-model", use_uld_loss=True, teacher_tokenizer_name_or_path="Qwen/Qwen2.5-0.5B-Instruct"),
-    train_dataset=train_dataset,
-)
-trainer.train()
-```
-
-For quick-start workflows you can rely on string identifiers as shown above—the trainer will load the model and tokenizer for you. Explicitly instantiating `AutoModelForCausalLM`, `AutoTokenizer`, or populating `GOLDConfig` is recommended only for advanced use cases where you need fine-grained control over initialization.
-
-A more explicit setup might look like this when you need to customise model loading, tokenizer settings, or training arguments:
-
-```python
-from datasets import load_dataset
-from trl import GOLDConfig, GOLDTrainer
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer
 
 student_name = "meta-llama/Llama-3.2-1B-Instruct"
 teacher_name = "Qwen/Qwen2.5-0.5B-Instruct"
@@ -66,9 +42,6 @@ teacher_name = "Qwen/Qwen2.5-0.5B-Instruct"
 tokenizer = AutoTokenizer.from_pretrained(student_name)
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
-
-model = AutoModelForCausalLM.from_pretrained(student_name)
-teacher_model = AutoModelForCausalLM.from_pretrained(teacher_name)
 
 train_dataset = load_dataset(
     "HuggingFaceTB/Countdown-Task-GOLD",
@@ -79,21 +52,24 @@ train_dataset = load_dataset(
 training_args = GOLDConfig(
     output_dir="gold-model",
     per_device_train_batch_size=1,
-    teacher_model=teacher_name,
     teacher_tokenizer_name_or_path=teacher_name,
+    use_external_teacher_vllm=True,
+    teacher_vllm_base_url="http://localhost:8000/v1/completions",
+    teacher_vllm_model_name=teacher_name,
     use_uld_loss=True,
     uld_use_hybrid_loss=True,
 )
 
 trainer = GOLDTrainer(
-    model=model,
-    teacher_model=teacher_model,
+    model=student_name,
     args=training_args,
     processing_class=tokenizer,
     train_dataset=train_dataset,
 )
 trainer.train()
 ```
+
+If you need finer-grained control over the student model instantiation, pass an already-initialized `AutoModelForCausalLM` as `model`.
 
 ### Expected dataset type
 

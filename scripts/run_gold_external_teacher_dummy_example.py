@@ -234,7 +234,6 @@ def main() -> None:
 
         trainer = GOLDTrainer(
             model=args.model_id,
-            teacher_model=None,
             args=train_args,
             train_dataset=dataset,
             eval_dataset=None,

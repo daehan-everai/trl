@@ -453,26 +453,6 @@ def test_generate_on_policy_outputs_masks_prompt_smollm(smollm_tokenizer, openr1
     assert assistant_completion in completion_texts[0]
 
 
-def test_generalized_jsd_loss_accepts_probability_inputs():
-    student_probs = torch.tensor([[[0.6, 0.3, 0.1]]])
-    teacher_probs = torch.tensor([[[0.5, 0.4, 0.1]]])
-    mixture = 0.5 * (student_probs + teacher_probs)
-    expected = 0.5 * (
-        torch.sum(student_probs * (torch.log(student_probs) - torch.log(mixture)))
-        + torch.sum(teacher_probs * (torch.log(teacher_probs) - torch.log(mixture)))
-    )
-
-    loss = GOLDTrainer.generalized_jsd_loss(
-        student_probs,
-        teacher_probs,
-        beta=0.5,
-        reduction="batchmean",
-        logits_are_probs=True,
-    )
-
-    assert torch.allclose(loss, expected, atol=1e-6)
-
-
 def test_uldloss_handles_llama_student_qwen_teacher_sequence(llama_tokenizer, qwen_tokenizer):
     config = build_config(
         uld_use_hybrid_loss=True,

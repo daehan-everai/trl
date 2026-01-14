@@ -158,7 +158,15 @@ def test_hybrid_uld_reverse_kl_and_sorted_l1():
     teacher_tok = ToyTokenizer(teacher_vocab)
     student_tok = ToyTokenizer(student_vocab)
 
-    loss_fn = ULDLoss(_config(), student_tokenizer=student_tok, teacher_tokenizer=teacher_tok)
+    loss_fn = ULDLoss(
+        _config(
+            uld_matched_divergence="skew_kl",
+            uld_matched_forward_kl_weight=0.0,
+            uld_matched_reverse_kl_weight=1.0,
+        ),
+        student_tokenizer=student_tok,
+        teacher_tokenizer=teacher_tok,
+    )
 
     student_aligned = torch.tensor([[0.2, 0.5, 0.3], [0.1, 0.6, 0.3]], dtype=torch.float32)
     teacher_aligned = torch.tensor(
