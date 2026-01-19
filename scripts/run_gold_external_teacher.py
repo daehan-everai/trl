@@ -349,6 +349,28 @@ def main() -> None:
         help="Weight for KL(student||teacher) when --uld-matched-divergence=skew_kl.",
     )
     parser.add_argument(
+        "--uld-renorm-matched-probs",
+        action="store_true",
+        help="Renormalize matched-token probabilities over the matched set before computing matched-token divergence.",
+    )
+    parser.add_argument(
+        "--log-alignment-groups",
+        action="store_true",
+        help="Log sample alignment groups to a JSONL file for debugging cross-tokenizer grouping.",
+    )
+    parser.add_argument(
+        "--log-alignment-groups-steps",
+        type=int,
+        default=50,
+        help="Steps between logging alignment-group samples when enabled.",
+    )
+    parser.add_argument(
+        "--log-alignment-groups-max-samples",
+        type=int,
+        default=1,
+        help="Max number of alignment-group samples to log per step.",
+    )
+    parser.add_argument(
         "--uld-crossentropy-weight",
         type=float,
         default=0.0,
@@ -777,6 +799,10 @@ def main() -> None:
             uld_matched_divergence=args.uld_matched_divergence,
             uld_matched_forward_kl_weight=args.uld_matched_forward_kl_weight,
             uld_matched_reverse_kl_weight=args.uld_matched_reverse_kl_weight,
+            uld_renorm_matched_probs=args.uld_renorm_matched_probs,
+            log_alignment_groups=args.log_alignment_groups,
+            log_alignment_groups_steps=args.log_alignment_groups_steps,
+            log_alignment_groups_max_samples=args.log_alignment_groups_max_samples,
             use_vllm=args.use_vllm,
             vllm_mode=args.vllm_mode,
             vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,

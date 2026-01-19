@@ -131,6 +131,8 @@ env HF_HOME=/workspace/.cache/huggingface \
 - W&B: use the run URL printed in the log.
 - Confirm off-policy is active by checking `off_policy_loss` when `--lmbda < 1`.
 - Confirm completions are valid by checking `num_valid_completion_tokens` stays > 0.
+- For cross-tokenizer alignment, monitor `alignment_groups_student` / `alignment_groups_teacher` for sudden drops.
+- Alignment group samples (when enabled) are written to `runs/gold-external-teacher/<run>/alignment_groups.jsonl`.
 - W&B tables: `completions` (on-policy) and `off_policy_completions` (dataset completions).
 - For `--uld-matched-divergence skew_kl`, `forward` means KL(teacher||student) and `reverse` means KL(student||teacher).
 - Check for teacher request errors:
@@ -164,5 +166,11 @@ rg -n "Teacher endpoint error|prompt_len|positions_min|positions_max" runs/gold-
   - Approach: expanded stop candidates to include `<|im_end|>`, `<|eot_id|>`, and newline variants derived from chat template/special tokens; added post-generation trimming after the first stop marker.
   - Approach: corrected stop-length handling and label/completion slicing to use per-example prompt lengths (left padding) instead of global prompt length.
   - Status: current run still shows extra user turns in some completions when inspecting samples; degeneration persists and needs further investigation.
+- Run notes (2026-01-19)
+  - Change: added `--uld-renorm-matched-probs` to renormalize matched-token probabilities before matched divergence.
+  - Change: added alignment-group logging (`--log-alignment-groups`, `--log-alignment-groups-steps`, `--log-alignment-groups-max-samples`).
+  - Observed: alignment group counts stayed stable through step 200+; no degeneration in completion structure.
+  - Observed: final-step loss was ~1.33 while matched_loss stayed ~5.33; this is expected when the last gradient-accumulation chunk is shorter and loss is scaled by the current accumulation steps.
+  - Output: merged checkpoint-200 pushed to `EverAI-AI/MagistSmall-Raven-ALT-2_full_epoch_patch_v43`.
 - Rollouts are logged to W&B via `wandb.Table` when `--log-rollouts` is enabled.
 - Secrets are loaded from `.env`; do not hardcode tokens in scripts.

@@ -172,6 +172,26 @@ class GOLDConfig(SFTConfig):
             "help": "Weight for KL(student||teacher) when uld_matched_divergence='skew_kl'. If None, uses beta."
         },
     )
+    uld_renorm_matched_probs: bool = field(
+        default=False,
+        metadata={
+            "help": "If True, renormalize matched-token probabilities over the matched set before computing the matched-token divergence."
+        },
+    )
+    log_alignment_groups: bool = field(
+        default=False,
+        metadata={
+            "help": "If True, log sample alignment groups to a JSONL file for debugging cross-tokenizer grouping."
+        },
+    )
+    log_alignment_groups_steps: int = field(
+        default=50,
+        metadata={"help": "Steps between logging alignment-group samples when enabled."},
+    )
+    log_alignment_groups_max_samples: int = field(
+        default=1,
+        metadata={"help": "Max number of alignment-group samples to log per step."},
+    )
     max_completion_length: int = field(
         default=128,
         metadata={"help": "Maximum number of tokens to generate per completion."},

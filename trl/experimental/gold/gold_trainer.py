@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import inspect
+import json
 import math
 import os
 import random
@@ -22,6 +23,7 @@ import warnings
 from collections import defaultdict, deque
 from collections.abc import Callable
 from contextlib import nullcontext
+from pathlib import Path
 from typing import Any, Optional
 
 import torch
@@ -362,6 +364,7 @@ class ULDLoss(nn.Module):
         self.matched_divergence = getattr(config, "uld_matched_divergence", "jsd")
         self.matched_forward_kl_weight = getattr(config, "uld_matched_forward_kl_weight", None)
         self.matched_reverse_kl_weight = getattr(config, "uld_matched_reverse_kl_weight", None)
+        self.renorm_matched_probs = getattr(config, "uld_renorm_matched_probs", False)
 
         # Initialize vocabulary mapping for hybrid loss
         self._vocab_mapping = None
@@ -796,6 +799,9 @@ class ULDLoss(nn.Module):
                         continue
                     student_row = student_matched_probs[row][valid]
                     teacher_row = teacher_row[valid]
+                    if self.renorm_matched_probs:
+                        teacher_row = teacher_row / teacher_row.sum().clamp_min(eps)
+                        student_row = student_row / student_row.sum().clamp_min(eps)
                     p = student_row.clamp_min(eps)
                     q = teacher_row.clamp_min(eps)
                     if divergence == "skew_kl":
@@ -816,6 +822,9 @@ class ULDLoss(nn.Module):
             else:
                 p = student_matched_probs.clamp_min(eps)
                 q = teacher_matched_probs.clamp_min(eps)
+                if self.renorm_matched_probs:
+                    p = p / p.sum(dim=-1, keepdim=True).clamp_min(eps)
+                    q = q / q.sum(dim=-1, keepdim=True).clamp_min(eps)
                 if divergence == "skew_kl":
                     kl_student_teacher = (p * (p.log() - q.log())).sum()
                     kl_teacher_student = (q * (q.log() - p.log())).sum()
@@ -1055,6 +1064,14 @@ class GOLDTrainer(SFTTrainer):
         self._unmatched_sum = 0.0
         self._matched_step_eq = 0.0
         self._unmatched_step_eq = 0.0
+        self._alignment_groups_student_sum = 0.0
+        self._alignment_groups_teacher_sum = 0.0
+        self._alignment_groups_step_eq = 0.0
+        self._alignment_groups_last_logged_step = -1
+
+        self.log_alignment_groups = getattr(args, "log_alignment_groups", False)
+        self.log_alignment_groups_steps = getattr(args, "log_alignment_groups_steps", 50)
+        self.log_alignment_groups_max_samples = getattr(args, "log_alignment_groups_max_samples", 1)
 
         self.use_transformers_paged = args.use_transformers_paged or False
 
@@ -1604,6 +1621,19 @@ class GOLDTrainer(SFTTrainer):
             distillation_losses: list[torch.Tensor] = []
             matched_losses: list[torch.Tensor] = []
             unmatched_losses: list[torch.Tensor] = []
+            alignment_group_student_total = 0.0
+            alignment_group_teacher_total = 0.0
+            alignment_group_count = 0
+            log_alignment_samples: list[dict[str, Any]] = []
+            log_alignment_this_step = False
+            if (
+                self.log_alignment_groups
+                and self.accelerator.is_main_process
+                and self.log_alignment_groups_steps > 0
+                and (self.state.global_step % self.log_alignment_groups_steps) == 0
+                and self.state.global_step != self._alignment_groups_last_logged_step
+            ):
+                log_alignment_this_step = True
 
             try:
                 for i in range(outputs_student.logits.size(0)):
@@ -1660,6 +1690,22 @@ class GOLDTrainer(SFTTrainer):
                         student_groups, teacher_groups = self.uld_loss_fn._build_alignment_groups_from_ids(
                             student_token_ids, teacher_token_ids
                         )
+                        alignment_group_student_total += float(len(student_groups))
+                        alignment_group_teacher_total += float(len(teacher_groups))
+                        alignment_group_count += 1
+                        if log_alignment_this_step and len(log_alignment_samples) < self.log_alignment_groups_max_samples:
+                            log_alignment_samples.append(
+                                {
+                                    "step": int(self.state.global_step),
+                                    "example_index": int(i),
+                                    "student_token_ids": student_token_ids,
+                                    "teacher_token_ids": teacher_token_ids,
+                                    "student_tokens": self.processing_class.convert_ids_to_tokens(student_token_ids),
+                                    "teacher_tokens": self.teacher_tokenizer.convert_ids_to_tokens(teacher_token_ids),
+                                    "student_groups": student_groups,
+                                    "teacher_groups": teacher_groups,
+                                }
+                            )
                         student_log_aligned = self.uld_loss_fn._merge_log_probs_with_alignment_groups(
                             student_log_probs, student_groups
                         )
@@ -1735,6 +1781,22 @@ class GOLDTrainer(SFTTrainer):
                 self._unmatched_sum += unmatched_val
                 self._matched_step_eq += step_eq
                 self._unmatched_step_eq += step_eq
+                if alignment_group_count > 0:
+                    self._alignment_groups_student_sum += alignment_group_student_total / alignment_group_count
+                    self._alignment_groups_teacher_sum += alignment_group_teacher_total / alignment_group_count
+                    self._alignment_groups_step_eq += step_eq
+
+                if log_alignment_this_step and log_alignment_samples:
+                    try:
+                        output_dir = Path(self.args.output_dir)
+                        output_dir.mkdir(parents=True, exist_ok=True)
+                        log_path = output_dir / "alignment_groups.jsonl"
+                        with log_path.open("a", encoding="utf-8") as handle:
+                            for record in log_alignment_samples:
+                                handle.write(json.dumps(record, ensure_ascii=True) + "\n")
+                        self._alignment_groups_last_logged_step = int(self.state.global_step)
+                    except Exception:
+                        pass
 
             empty_cache()
             return (loss, outputs_student) if return_outputs else loss
@@ -2466,6 +2528,9 @@ class GOLDTrainer(SFTTrainer):
                     self._unmatched_step_eq,
                     self._valid_completion_tokens_sum,
                     self._valid_completion_tokens_step_eq,
+                    self._alignment_groups_student_sum,
+                    self._alignment_groups_teacher_sum,
+                    self._alignment_groups_step_eq,
                 ],
                 dtype=torch.float64,
                 device=device,
@@ -2490,6 +2555,9 @@ class GOLDTrainer(SFTTrainer):
                 unmatched_eq,
                 valid_sum,
                 valid_eq,
+                align_student_sum,
+                align_teacher_sum,
+                align_eq,
             ) = vec.tolist()
 
             # Compute category averages over the *same window* as Trainer's logs
@@ -2505,6 +2573,9 @@ class GOLDTrainer(SFTTrainer):
                 logs["unmatched_loss"] = round(unmatched_sum / unmatched_eq, 4)
             if valid_eq > 0:
                 logs["num_valid_completion_tokens"] = round(valid_sum / valid_eq, 4)
+            if align_eq > 0:
+                logs["alignment_groups_student"] = round(align_student_sum / align_eq, 4)
+                logs["alignment_groups_teacher"] = round(align_teacher_sum / align_eq, 4)
 
             # Reset window accumulators after logging (just like Trainer resets its window)
             self._on_policy_loss_total = self._off_policy_loss_total = 0.0
@@ -2513,6 +2584,9 @@ class GOLDTrainer(SFTTrainer):
             self._matched_step_eq = self._unmatched_step_eq = 0.0
             self._valid_completion_tokens_sum = 0.0
             self._valid_completion_tokens_step_eq = 0.0
+            self._alignment_groups_student_sum = 0.0
+            self._alignment_groups_teacher_sum = 0.0
+            self._alignment_groups_step_eq = 0.0
 
         # This method can be called both in training and evaluation. When called in evaluation, the keys in `logs`
         # start with "eval_". We need to add the prefix "eval_" to the keys in `metrics` to match the format.
