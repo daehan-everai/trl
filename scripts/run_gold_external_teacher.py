@@ -457,7 +457,7 @@ def main() -> None:
     parser.add_argument(
         "--lmbda",
         type=float,
-        default=0.9,
+        default=1.0,
         help="Fraction of on-policy rollouts (1.0 = on-policy only).",
     )
     parser.add_argument("--min-new-tokens", type=int, default=None, help="Force a minimum number of generated tokens.")
