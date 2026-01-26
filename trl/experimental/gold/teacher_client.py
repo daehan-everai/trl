@@ -96,7 +96,6 @@ class VLLMTeacherClient:
                 raise ValueError("`full_logprobs_max_top_k` must be > 0.")
         object.__setattr__(config, "base_url", config.base_url.rstrip("/"))
         self.config = config
-
     def _request_payload(self, token_ids: list[int], positions: list[int]) -> dict[str, Any]:
         full_logprobs = {
             "enabled": True,
@@ -249,6 +248,7 @@ class VLLMTeacherClient:
                 return choice["full_logprobs"]
 
         raise ValueError("Teacher response missing `full_logprobs` payload.")
+
 
     def _post_json(self, payload: dict[str, Any]) -> dict[str, Any]:
         if is_requests_available():

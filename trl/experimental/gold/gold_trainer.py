@@ -2447,7 +2447,7 @@ class GOLDTrainer(SFTTrainer):
                 1, int(getattr(self, "current_gradient_accumulation_steps", self.args.gradient_accumulation_steps))
             )
             loss_scale = 1.0
-            if self.use_apex:
+            if getattr(self, "use_apex", False):
                 from apex import amp
 
                 with amp.scale_loss(total_loss, self.optimizer) as scaled_loss:
